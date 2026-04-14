@@ -10,7 +10,7 @@ A GUI tool for rating, blending, and previewing voices from the [Kokoro-82M](htt
 
 **Ratings tab** — Work through all 54 Kokoro voices and rate each one on 8 perceptual axes: age, authority, clarity, energy, gender presentation, pitch, roughness, and warmth. Navigate with arrow keys. Ratings auto-save as you go.
 
-**Mixer tab** — Blend up to 3 voices by weight. Per-slot pitch shift (semitones) and speed control for individual slot previews. Global output speed (0.25–2.0×) and pitch shift (±12 semitones) applied to the final blended preview and export. Export the result as a `.bin` file that Kokoro can use directly as a custom voice.
+**Mixer tab** — Blend up to 3 voices by weight. Per-slot pitch and speed sliders let you audition each voice individually. Separate Output Speed (0.25–2.0×) and Output Pitch (±12 semitones) controls apply to the final blended preview and export. Export the result as a `.bin` file that Kokoro can use directly as a custom voice.
 
 **Trait Match Assist** — Set target trait values and the tool suggests the 3 closest voices from your rated library. Uses the same axis scores, so suggestions get better the more voices you rate.
 
@@ -84,15 +84,26 @@ The tool auto-detects the `voices/` folder and working directory on first launch
 
 ---
 
-## Mixer: how weighting works
+## Mixer: how it works
+
+### Weights
 
 Blending mixes the raw voice embedding tensors (256-dim float32 vectors) by weighted average. Weights are always normalized to sum to 1 before the blend is applied — this keeps the mixed tensor at the same scale as the original voices, which is required for the ONNX model to produce valid audio. A 50/30/20 split is identical to a 5/3/2 split.
 
-**Per-slot speed and pitch** (in each slot card) apply when previewing that slot individually. They are averaged across active slots for mix previews.
+### Speed and pitch — two separate sets of controls
 
-**Output Speed and Output Pitch** (in the Mix Output panel) apply to the final blended synthesis — use these to tune the whole mix without touching individual slots.
+**Per-slot Pitch and Speed** apply only in **▶ Preview Slot**. They let you audition each voice individually at different tempos and registers before committing to a blend.
 
-Exported `.bin` files are always normalized. They match the format of the vendor voices and can be dropped into the `voices/` folder for use with any Kokoro-compatible tool.
+**▶ Preview Mix** works differently: the slot embeddings are blended into a single voice bin, synthesised once, and then the Output Speed / Output Pitch controls are applied as a final stage. Per-slot pitch and speed are not applied during mix preview — mixing separately-synthesised clips of different durations causes overlap, and there is no clean way to time-align them at the audio level.
+
+**Output Speed / Output Pitch** (in the Mix Output panel) control the final result — both for **▶ Preview Mix** and for the exported `.bin` synthesis. Use these to tune overall tempo and register of the blended voice.
+
+- Use **Reset Output FX** to snap both back to default (speed 1.0×, pitch 0 semitones).
+- All pitch and speed transforms use ffmpeg. **ffmpeg must be on your PATH** for any non-default value. At defaults (pitch 0, speed 1.0) ffmpeg is not called.
+
+### Exported `.bin` files
+
+Always normalized. Match the raw float32 format of the vendor voices and can be dropped into the `voices/` folder for use with any Kokoro-compatible tool. The sidecar JSON records the blend recipe so you can recreate it later.
 
 ---
 

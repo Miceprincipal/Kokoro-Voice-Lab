@@ -144,8 +144,23 @@ class KokoroSynthAdapter:
             raise RuntimeError(f"Synthesis completed but no output file: {out_wav}")
 
     def transform_audio(self, src_wav: Path, dst_wav: Path, speed: float, pitch_semitones: float) -> None:
+        """Apply speed and/or pitch shift, preserving duration for pitch-only changes.
+
+        asetrate+aresample shifts pitch but shortens the audio by factor `ratio`.
+        The atempo stage must compensate: tempo = speed / ratio restores duration
+        when speed == 1.0, or combines both effects when speed != 1.0.
+        """
         filters: list[str] = []
-        remaining = max(0.25, min(speed, 4.0))
+        if abs(pitch_semitones) > 1e-6:
+            ratio = 2 ** (pitch_semitones / 12.0)
+            filters.append(f"asetrate=24000*{ratio:.8f}")
+            filters.append("aresample=24000")
+            # Compensate for duration change caused by asetrate: tempo = speed / ratio.
+            # At speed=1.0 this is 1/ratio, which restores original duration.
+            tempo = speed / ratio
+        else:
+            tempo = speed
+        remaining = max(0.25, min(tempo, 4.0))
         while remaining > 2.0:
             filters.append("atempo=2.0")
             remaining /= 2.0
@@ -153,10 +168,6 @@ class KokoroSynthAdapter:
             filters.append("atempo=0.5")
             remaining /= 0.5
         filters.append(f"atempo={remaining:.5f}")
-        if abs(pitch_semitones) > 1e-6:
-            ratio = 2 ** (pitch_semitones / 12.0)
-            filters.insert(0, f"asetrate=24000*{ratio:.8f}")
-            filters.insert(1, "aresample=24000")
         cmd = [self.ffmpeg_path, "-y", "-i", str(src_wav), "-af", ",".join(filters), str(dst_wav)]
         subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if not dst_wav.exists():
@@ -311,9 +322,9 @@ class PersistentSynthServer:
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def synthesize(self, voice_path: Path, text: str, out_wav: Path) -> None:
+    def synthesize(self, voice_path: Path, text: str, out_wav: Path, speed: float = 1.0) -> None:
         with self._lock:
-            req = json.dumps({"voice": str(voice_path), "text": text, "out": str(out_wav)}) + "\n"
+            req = json.dumps({"voice": str(voice_path), "text": text, "out": str(out_wav), "speed": speed}) + "\n"
             self._proc.stdin.write(req)
             self._proc.stdin.flush()
             resp_line = self._proc.stdout.readline()
@@ -388,6 +399,8 @@ class VoiceLabApp:
         # ── mix output controls (global, applied post-blend) ─────────────────
         self.mix_speed_var = tk.DoubleVar(value=1.0)
         self.mix_pitch_var = tk.DoubleVar(value=0.0)
+        self._export_speed = 1.0
+        self._export_pitch = 0.0
 
         # ── ratings tab vars ─────────────────────────────────────────────────
         self.rating_trait_vars:  dict[str, tk.IntVar] = {}
@@ -683,9 +696,9 @@ class VoiceLabApp:
     def _can_synthesize(self) -> bool:
         return self._server.is_running() or self.synth.is_configured()
 
-    def _do_synthesize(self, voice_path: Path, text: str, out: Path) -> None:
+    def _do_synthesize(self, voice_path: Path, text: str, out: Path, speed: float = 1.0) -> None:
         if self._server.is_running():
-            self._server.synthesize(voice_path, text, out)
+            self._server.synthesize(voice_path, text, out, speed=speed)
         elif self.synth.is_configured():
             self.synth.synthesize(voice_path, text, out)
         else:
@@ -817,6 +830,9 @@ class VoiceLabApp:
 
         self._build_mix_panel(mid)
 
+        ttk.Label(parent, text="¹ Speed affects preview only — not baked into exported .bin",
+                  foreground="#888", font=("Segoe UI", 8)).pack(anchor="w", padx=4, pady=(2, 0))
+
         # ── trait match assist ───────────────────────────────────────────────
         ta = ttk.LabelFrame(parent, text="Trait Match Assist  (set target traits → suggest best voices)", padding=(8, 4))
         ta.pack(fill="x", pady=(8, 0))
@@ -854,7 +870,7 @@ class VoiceLabApp:
 
         _row("Weight %", self.weight_vars[idx], 0, 100, 1)
         _row("Pitch st", self.pitch_vars[idx], -12, 12, 0.5)
-        _row("Speed", self.speed_vars[idx], 0.25, 2.0, 0.01)
+        _row("Speed ¹", self.speed_vars[idx], 0.25, 2.0, 0.01)
 
         btn_row = ttk.Frame(sf)
         btn_row.pack(fill="x", pady=(6, 0))
@@ -1032,12 +1048,13 @@ class VoiceLabApp:
 
     def _synth_and_play(self, voice_path: Path, speed: float, pitch: float, wav_name: str) -> None:
         base = self.temp_dir / f"{wav_name}_base.wav"
-        self._do_synthesize(voice_path, self.test_sentence_var.get() or DEFAULT_TEST_SENTENCE, base)
-        if KokoroSynthAdapter.is_identity(speed, pitch):
+        # Speed is handled by the ONNX model natively; pitch requires ffmpeg post-processing.
+        self._do_synthesize(voice_path, self.test_sentence_var.get() or DEFAULT_TEST_SENTENCE, base, speed=speed)
+        if abs(pitch) < 1e-6:
             final = base
         else:
             final = self.temp_dir / f"{wav_name}_fx.wav"
-            self.synth.transform_audio(base, final, speed, pitch)
+            self.synth.transform_audio(base, final, 1.0, pitch)
         self.player.load(final)
         self.player.play()
 
@@ -1077,15 +1094,24 @@ class VoiceLabApp:
         VoiceLibrary.save_bin(arr, p)
         return arr, p
 
-    def _weighted_fx(self) -> tuple[float, float]:
-        """Return (pitch, speed) averaged by normalized active weights."""
-        weights = np.array([float(self.weight_vars[i].get()) if self.active_vars[i].get() else 0.0
-                             for i in range(3)], dtype=np.float32)
-        if weights.sum() > 0:
-            weights /= weights.sum()
-        pitch = float(sum(float(self.pitch_vars[i].get()) * weights[i] for i in range(3)))
-        speed = float(sum(float(self.speed_vars[i].get()) * weights[i] for i in range(3))) or 1.0
-        return pitch, speed
+    def _effective_mix_speed(self) -> float:
+        """Weighted average of active slot speeds, multiplied by the output speed control.
+
+        Per-slot speeds contribute proportionally to their blend weights so the mix
+        preview inherits the tempo character of the constituent voices. Output Speed
+        then acts as a final multiplier (default 1.0 = no additional change).
+        """
+        comps = self._mix_components()
+        total_weight = sum(w for _, w in comps)
+        if comps and total_weight > 1e-9:
+            ws = 0.0
+            for i in range(3):
+                if self._get_slot_voice(i) is not None:
+                    ws += float(self.weight_vars[i].get()) * float(self.speed_vars[i].get())
+            slot_speed = ws / total_weight
+        else:
+            slot_speed = 1.0
+        return max(0.25, min(slot_speed * float(self.mix_speed_var.get()), 4.0))
 
     def preview_mix(self) -> None:
         if not self._require_voices():
@@ -1097,10 +1123,10 @@ class VoiceLabApp:
         if not self._can_synthesize():
             messagebox.showerror(APP_TITLE, "Start the server (Config tab) or configure a synth command.")
             return
+        speed = self._effective_mix_speed()
+        pitch = float(self.mix_pitch_var.get())
         def task() -> None:
             _, mix_bin = self._build_mix_bin()
-            speed = float(self.mix_speed_var.get())
-            pitch = float(self.mix_pitch_var.get())
             self._synth_and_play(mix_bin, speed, pitch, "mix")
         self._run_bg(task, success="Mix preview playing")
 
@@ -1119,14 +1145,19 @@ class VoiceLabApp:
             out.with_suffix(".json").write_text(json.dumps(self._mix_preset_data(), indent=2))
         self.last_export_path = out
         if self.auto_preview_var.get():
-            speed = float(self.mix_speed_var.get())
-            pitch = float(self.mix_pitch_var.get())
-            self._synth_and_play(out, speed, pitch, "mix_export")
+            # speed/pitch captured by caller on main thread and passed through
+            self._synth_and_play(out, self._export_speed, self._export_pitch, "mix_export")
+
+    def _capture_export_fx(self) -> None:
+        """Capture speed/pitch on the main thread before handing off to background."""
+        self._export_speed = self._effective_mix_speed()
+        self._export_pitch = float(self.mix_pitch_var.get())
 
     def export_mix_bin_default(self) -> None:
         if not self._require_voices():
             return
         out = self._default_export_path()
+        self._capture_export_fx()
         self._run_bg(lambda: self._write_export(out), success=f"Exported → {out.name}")
 
     def save_mix_bin_as(self) -> None:
@@ -1139,6 +1170,7 @@ class VoiceLabApp:
         out = Path(path)
         self.export_dir_var.set(str(out.parent))
         self.export_name_var.set(out.stem)
+        self._capture_export_fx()
         self._run_bg(lambda: self._write_export(out), success=f"Saved → {out.name}")
 
     def _mix_preset_data(self) -> dict[str, Any]:
