@@ -1,0 +1,23 @@
+{
+  "command_template": "python infer.py --voice \"{voice}\" --text \"{text}\" --output \"{out}\"",
+  "ffmpeg_path": "ffmpeg",
+  "working_dir": "",
+  "voice_dir": "",
+  "ratings_path": "voice_ratings.json",
+  "export_dir": "exports",
+  "export_name": "mixed_voice",
+  "test_sentence": "The quick brown fox jumps over the lazy dog. This is a voice preview sample.",
+  "preview_mode": "external_cmd",
+  "normalize_weights": true,
+  "auto_preview_mix": false,
+  "save_sidecar": true,
+  "autosave_config": true,
+  "mix_speed": 1.0,
+  "mix_pitch": 0.0,
+  "slots": [
+    {"active": true,  "voice": "", "weight": 50.0, "pitch": 0.0, "speed": 1.0},
+    {"active": false, "voice": "", "weight": 30.0, "pitch": 0.0, "speed": 1.0},
+    {"active": false, "voice": "", "weight": 20.0, "pitch": 0.0, "speed": 1.0}
+  ],
+  "last_export_path": ""
+}
