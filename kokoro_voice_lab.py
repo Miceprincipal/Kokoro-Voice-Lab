@@ -33,6 +33,12 @@ DEFAULT_CONFIG_PATH = APP_DIR / "voice_lab_config.json"
 DEFAULT_RATINGS_PATH = APP_DIR / "voice_ratings.json"
 DEFAULT_EXPORT_DIR = APP_DIR / "exports"
 DEFAULT_ANALYSIS_CSV_PATH = APP_DIR.parent.parent / "cache" / "voice-audition" / "voice-analysis.csv"
+VOICE_MATCH_MFCC_PATH = APP_DIR / "voice_match_mfcc.json"
+VOICE_MATCH_COVERAGE = (
+    "When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. "
+    "She sells seashells by the seashore. "
+    "How vividly I remember those frigid winter days."
+)
 
 DEFAULT_TRAIT_LABELS = ["age", "authority", "clarity", "energy", "gender_pres", "pitch", "roughness", "warmth"]
 
@@ -494,6 +500,16 @@ class VoiceLabApp:
         self._slot_info_vars = [tk.StringVar(value="—") for _ in range(3)]
         self._acoustic: dict[str, dict] = {}
 
+        # ── voice match tab vars ─────────────────────────────────────────────
+        self._vmatch_status_var   = tk.StringVar(value="Not built")
+        self._vmatch_deps_var     = tk.StringVar(value="")
+        self._vmatch_progress_var = tk.StringVar(value="")
+        self._vmatch_ref_var      = tk.StringVar(value="")
+        self._vmatch_mfcc_db: dict[str, dict] = {}
+        self._vmatch_scores: list[tuple[float, str]] = []
+        self._vmatch_results_listbox: tk.Listbox | None = None
+        self._vmatch_transcript_widget: tk.Text | None = None
+
         # ── shared vars ──────────────────────────────────────────────────────
         self.status_var        = tk.StringVar(value="Load a voice folder to begin.")
         self.position_var      = tk.StringVar(value="--:-- / --:--")
@@ -556,13 +572,16 @@ class VoiceLabApp:
 
         t_ratings = ttk.Frame(nb, padding=8)
         t_mixer   = ttk.Frame(nb, padding=8)
+        t_vmatch  = ttk.Frame(nb, padding=8)
         t_config  = ttk.Frame(nb, padding=8)
         nb.add(t_ratings, text="  Ratings  ")
         nb.add(t_mixer,   text="  Mixer  ")
+        nb.add(t_vmatch,  text="  Voice Match  ")
         nb.add(t_config,  text="  Config  ")
 
         self._build_ratings_tab(t_ratings)
         self._build_mixer_tab(t_mixer)
+        self._build_voice_match_tab(t_vmatch)
         self._build_config_tab(t_config)
 
         bar = ttk.Frame(self.root, padding=(8, 2, 8, 4))
@@ -1206,6 +1225,283 @@ class VoiceLabApp:
         diag = ttk.LabelFrame(parent, text="Asset Diagnostics", padding=10)
         diag.pack(fill="x", pady=(12, 0))
         ttk.Button(diag, text="Check ONNX Assets", command=self.check_direct_assets).pack(anchor="w")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Voice Match tab
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _build_voice_match_tab(self, parent: ttk.Frame) -> None:
+        # ── Module status ─────────────────────────────────────────────────────
+        mod = ttk.LabelFrame(parent, text="  Module Status  ", padding=10)
+        mod.pack(fill="x", pady=(0, 8))
+        mod.columnconfigure(1, weight=1)
+
+        ttk.Label(mod, text="Dependencies:").grid(row=0, column=0, sticky="w")
+        ttk.Label(mod, textvariable=self._vmatch_deps_var,
+                  foreground="#555", font=("Segoe UI", 8)).grid(row=0, column=1, sticky="w", padx=(8, 0))
+
+        ttk.Label(mod, text="Fingerprints:").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(mod, textvariable=self._vmatch_status_var,
+                  foreground="#555").grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+
+        btn_row = ttk.Frame(mod)
+        btn_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Button(btn_row, text="Build Fingerprints",
+                   command=self.vmatch_build).pack(side="left")
+        ttk.Label(btn_row, textvariable=self._vmatch_progress_var,
+                  foreground="#666", font=("Segoe UI", 8)).pack(side="left", padx=(10, 0))
+
+        ttk.Label(mod,
+                  text="Synthesises a phonetically-balanced sentence for each voice, extracts MFCC fingerprints. "
+                       "Server must be running. One-time cost; saved to voice_match_mfcc.json.",
+                  foreground="#888", font=("Segoe UI", 8), wraplength=700, justify="left",
+                  ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        # ── Reference audio ───────────────────────────────────────────────────
+        ref = ttk.LabelFrame(parent, text="  Reference Audio  ", padding=10)
+        ref.pack(fill="x", pady=(0, 8))
+        ref.columnconfigure(1, weight=1)
+
+        ttk.Label(ref, text="File:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(ref, textvariable=self._vmatch_ref_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0))
+        ttk.Button(ref, text="Browse…",
+                   command=self.vmatch_select_ref).grid(row=0, column=2, padx=(6, 0))
+
+        ttk.Label(ref, text="Transcript:").grid(row=1, column=0, sticky="nw", pady=(8, 0))
+        tx = tk.Text(ref, height=3, width=60, wrap="word", font=("Segoe UI", 9))
+        tx.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
+        self._vmatch_transcript_widget = tx
+        ttk.Button(ref, text="Transcribe (Whisper)",
+                   command=self.vmatch_transcribe).grid(row=1, column=2, sticky="n", padx=(6, 0), pady=(8, 0))
+
+        ttk.Label(ref,
+                  text="Transcript is informational only — matching uses MFCC statistics, not text content. "
+                       "Requires faster-whisper or openai-whisper.",
+                  foreground="#888", font=("Segoe UI", 8), wraplength=700, justify="left",
+                  ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        # ── Results ───────────────────────────────────────────────────────────
+        res = ttk.LabelFrame(parent, text="  Match Results  ", padding=10)
+        res.pack(fill="both", expand=True)
+
+        lb = tk.Listbox(res, height=8, font=("Consolas", 9), activestyle="none",
+                        selectmode="browse")
+        lb.pack(fill="x", pady=(0, 8))
+        self._vmatch_results_listbox = lb
+
+        act_row = ttk.Frame(res)
+        act_row.pack(anchor="w")
+        ttk.Button(act_row, text="Find Match",
+                   command=self.vmatch_find_match).pack(side="left")
+        ttk.Button(act_row, text="Load Top 3 → Mixer",
+                   command=self.vmatch_load_to_mixer).pack(side="left", padx=(8, 0))
+        ttk.Button(act_row, text="Export Direct",
+                   command=self.vmatch_export_direct).pack(side="left", padx=(8, 0))
+        ttk.Button(act_row, text="■  Stop",
+                   command=self.stop_audio).pack(side="right", padx=(16, 0))
+
+        # populate dep status on build
+        self.root.after(100, self._vmatch_refresh_deps)
+        self.root.after(150, self._vmatch_load_cached_fingerprints)
+
+    def _vmatch_refresh_deps(self) -> None:
+        parts = []
+        try:
+            import librosa  # noqa: F401
+            parts.append("librosa ✓")
+        except ImportError:
+            parts.append("librosa ✗  (pip install librosa)")
+        whisper_ok = False
+        try:
+            import faster_whisper  # noqa: F401
+            parts.append("faster-whisper ✓")
+            whisper_ok = True
+        except ImportError:
+            pass
+        if not whisper_ok:
+            try:
+                import whisper  # noqa: F401
+                parts.append("openai-whisper ✓")
+            except ImportError:
+                parts.append("whisper ✗  (pip install faster-whisper)")
+        self._vmatch_deps_var.set("  |  ".join(parts))
+
+    def _vmatch_load_cached_fingerprints(self) -> None:
+        if not VOICE_MATCH_MFCC_PATH.exists():
+            self._vmatch_status_var.set("Not built — click Build Fingerprints")
+            return
+        try:
+            data = json.loads(VOICE_MATCH_MFCC_PATH.read_text(encoding="utf-8"))
+            self._vmatch_mfcc_db = data.get("voices", {})
+            valid = sum(1 for v in self._vmatch_mfcc_db.values() if "mean" in v)
+            total = len(self._vmatch_mfcc_db)
+            self._vmatch_status_var.set(f"Ready — {valid}/{total} voices fingerprinted")
+        except Exception as exc:
+            self._vmatch_status_var.set(f"Could not load: {exc}")
+
+    def _vmatch_build_worker(self) -> None:
+        """Background: synthesise coverage sentence for all voices, extract MFCCs, save JSON."""
+        try:
+            import librosa
+        except ImportError:
+            self.root.after(0, lambda: self._vmatch_status_var.set(
+                "librosa not installed — pip install librosa"))
+            return
+
+        if not self._can_synthesize():
+            self.root.after(0, lambda: self._vmatch_progress_var.set("Start server first."))
+            return
+
+        voices = list(self.voice_lib.voices)
+        total = len(voices)
+        db: dict[str, dict] = {}
+        tmp = self.temp_dir / "_vmatch_cov.wav"
+
+        for i, v in enumerate(voices, 1):
+            try:
+                self._do_synthesize(v.path, VOICE_MATCH_COVERAGE, tmp)
+                y, sr = librosa.load(str(tmp), sr=22050, mono=True)
+                mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+                db[v.name] = {
+                    "mean": mfcc.mean(axis=1).tolist(),
+                    "std":  mfcc.std(axis=1).tolist(),
+                }
+            except Exception as exc:
+                db[v.name] = {"error": str(exc)}
+            n = i
+            self.root.after(0, lambda n=n, t=total: self._vmatch_progress_var.set(
+                f"Building {n}/{t}…"))
+
+        valid = sum(1 for fp in db.values() if "mean" in fp)
+        VOICE_MATCH_MFCC_PATH.write_text(json.dumps({
+            "coverage_sentence": VOICE_MATCH_COVERAGE,
+            "voices": db,
+        }, indent=2), encoding="utf-8")
+        self._vmatch_mfcc_db = db
+        msg = f"Ready — {valid}/{total} voices fingerprinted"
+        self.root.after(0, lambda: self._vmatch_status_var.set(msg))
+        self.root.after(0, lambda: self._vmatch_progress_var.set(""))
+        self.root.after(0, lambda: self.status_var.set(msg))
+
+    def vmatch_build(self) -> None:
+        if not self._require_voices():
+            return
+        if not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server (Config tab) first.")
+            return
+        self._vmatch_status_var.set("Building…")
+        self._vmatch_progress_var.set("")
+        threading.Thread(target=self._vmatch_build_worker, daemon=True).start()
+
+    def vmatch_select_ref(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select reference audio",
+            filetypes=[("Audio files", "*.wav *.mp3 *.flac *.ogg *.m4a"), ("All files", "*.*")],
+        )
+        if path:
+            self._vmatch_ref_var.set(path)
+
+    def vmatch_transcribe(self) -> None:
+        ref = self._vmatch_ref_var.get().strip()
+        if not ref:
+            self.status_var.set("Select a reference audio file first.")
+            return
+
+        def task() -> None:
+            text = ""
+            try:
+                from faster_whisper import WhisperModel
+                model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                segments, _ = model.transcribe(ref)
+                text = " ".join(seg.text.strip() for seg in segments)
+            except ImportError:
+                try:
+                    import whisper
+                    result = whisper.load_model("tiny").transcribe(ref)
+                    text = result["text"].strip()
+                except ImportError:
+                    text = "[neither faster-whisper nor openai-whisper is installed]"
+            except Exception as exc:
+                text = f"[Error: {exc}]"
+
+            def update() -> None:
+                if self._vmatch_transcript_widget:
+                    self._vmatch_transcript_widget.delete("1.0", "end")
+                    self._vmatch_transcript_widget.insert("1.0", text)
+                self.status_var.set("Transcription complete")
+            self.root.after(0, update)
+
+        self.status_var.set("Transcribing…")
+        threading.Thread(target=task, daemon=True).start()
+
+    def vmatch_find_match(self) -> None:
+        ref = self._vmatch_ref_var.get().strip()
+        if not ref:
+            self.status_var.set("Select a reference audio file first.")
+            return
+        if not self._vmatch_mfcc_db:
+            self.status_var.set("Build fingerprints first.")
+            return
+
+        def task() -> None:
+            try:
+                import librosa
+            except ImportError:
+                self.root.after(0, lambda: self.status_var.set(
+                    "librosa not installed — pip install librosa"))
+                return
+            y, sr = librosa.load(ref, sr=22050, mono=True)
+            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+            ref_vec = np.concatenate([mfcc.mean(axis=1), mfcc.std(axis=1)])
+
+            scored: list[tuple[float, str]] = []
+            for name, fp in self._vmatch_mfcc_db.items():
+                if "mean" not in fp:
+                    continue
+                fp_vec = np.concatenate([np.array(fp["mean"]), np.array(fp["std"])])
+                dist = float(np.linalg.norm(ref_vec - fp_vec))
+                scored.append((dist, name))
+            scored.sort()
+            self._vmatch_scores = scored
+
+            def update() -> None:
+                if self._vmatch_results_listbox:
+                    self._vmatch_results_listbox.delete(0, "end")
+                    for rank, (dist, name) in enumerate(scored[:10], 1):
+                        self._vmatch_results_listbox.insert(
+                            "end", f"  {rank:2}.  {name:<22}  dist = {dist:.3f}")
+                self.status_var.set(
+                    f"Best match: {scored[0][1]}" if scored else "No results")
+            self.root.after(0, update)
+
+        self._run_bg(task, success="Match complete")
+
+    def vmatch_load_to_mixer(self) -> None:
+        if not self._vmatch_scores:
+            self.status_var.set("Run Find Match first.")
+            return
+        top = self._vmatch_scores[:3]
+        inv = [1.0 / (d + 1e-9) for d, _ in top]
+        total_inv = sum(inv)
+        weights = [100.0 * v / total_inv for v in inv]
+        for i, ((dist, name), w) in enumerate(zip(top, weights)):
+            self.active_vars[i].set(True)
+            self.voice_vars[i].set(name)
+            self.weight_vars[i].set(round(w, 1))
+        self.status_var.set("Top 3 loaded into Mixer — switch to Mixer tab to preview")
+        self._recompute_summary()
+
+    def vmatch_export_direct(self) -> None:
+        if not self._vmatch_scores:
+            self.status_var.set("Run Find Match first.")
+            return
+        if not self._require_voices():
+            return
+        self.vmatch_load_to_mixer()
+        out = self._default_export_path()
+        self._capture_export_fx()
+        self._run_bg(lambda: self._write_export(out), success=f"Exported → {out.name}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Mixer logic

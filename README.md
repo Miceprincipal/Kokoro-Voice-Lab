@@ -24,6 +24,8 @@ A GUI tool for rating, blending, and previewing voices from the [Kokoro-82M](htt
 
 **Voice list auto-refresh** — After exporting a `.bin`, the voice dropdowns automatically rescan the voices folder. Newly exported voices are immediately available in all slots without restarting.
 
+**Voice Match tab** — Drop in any WAV or MP3 of a real voice. The tool computes MFCC distance between the reference audio and pre-built fingerprints for every Kokoro voice, then ranks all voices by similarity. Load the top 3 into the Mixer (with inverse-distance weights pre-set) or export a blended approximation directly. Optional Whisper transcription shows what was spoken but is not used for matching — the comparison is purely acoustic. Requires `librosa`; transcription requires `faster-whisper` or `openai-whisper`.
+
 ---
 
 ## Setup
@@ -186,7 +188,9 @@ The sidecar JSON (saved alongside the `.bin`) records what voices were blended a
 | `numpy` | Yes | Voice bin arithmetic and tensor operations |
 | `scikit-learn` | Recommended | Required for Bake slot pitch; gracefully disabled if absent |
 | `Pillow` | Recommended | Logo transparency support; gracefully absent otherwise |
-| `librosa` | Optional | Required only for `extend_voice_analysis.py` |
+| `librosa` | Optional | Required for Voice Match fingerprints and `extend_voice_analysis.py` |
+| `faster-whisper` | Optional | Voice Match transcription (preferred — smaller/faster) |
+| `openai-whisper` | Optional | Voice Match transcription (fallback if faster-whisper absent) |
 | `ffmpeg` | Optional | Required for non-default pitch/speed when bake is off |
 
 Python 3.10 or later.
