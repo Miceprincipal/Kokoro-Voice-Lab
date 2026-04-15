@@ -32,6 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "voice_lab_config.json"
 DEFAULT_RATINGS_PATH = APP_DIR / "voice_ratings.json"
 DEFAULT_EXPORT_DIR = APP_DIR / "exports"
+DEFAULT_ANALYSIS_CSV_PATH = APP_DIR.parent.parent / "cache" / "voice-audition" / "voice-analysis.csv"
 
 DEFAULT_TRAIT_LABELS = ["age", "authority", "clarity", "energy", "gender_pres", "pitch", "roughness", "warmth"]
 
@@ -253,6 +254,124 @@ class VoiceLibrary:
         path.parent.mkdir(parents=True, exist_ok=True)
         arr.astype(np.float32).tofile(path)
 
+    def mix_with_pitch_bake(
+        self,
+        components: list[tuple["VoiceBin", float]],
+        pitch_shifts: list[float],
+        pitch_axis: "PitchAxis",
+        normalize: bool = True,
+    ) -> np.ndarray:
+        """Like mix() but shifts each component's embedding along the pitch axis before blending."""
+        active = [(v, w, ps) for (v, w), ps in zip(components, pitch_shifts) if w > 0]
+        if not active:
+            raise ValueError("No active voices.")
+        lengths = {v.value_count for v, _, _ in active}
+        if len(lengths) != 1:
+            raise ValueError(f"Mismatched bin sizes: {sorted(lengths)}")
+        weights = np.array([w for _, w, _ in active], dtype=np.float32)
+        if normalize:
+            s = float(weights.sum())
+            if s <= 0:
+                raise ValueError("Weights sum to zero.")
+            weights /= s
+        out = np.zeros(next(iter(lengths)), dtype=np.float32)
+        for i, (v, _, pitch_st) in enumerate(active):
+            emb = self.load_array(v).copy()
+            emb = pitch_axis.shift(emb, pitch_st)
+            out += emb * weights[i]
+        return out
+
+
+class PitchAxis:
+    """Derives a pitch direction vector in Kokoro's embedding space from f0 measurements.
+
+    Fits a Ridge regression over (voice_embedding → log_f0_hz) using the acoustic
+    analysis CSV produced by the voice audition pipeline. The regression coefficient
+    vector points in the direction of increasing pitch in embedding space.
+
+    Shifting a .bin along this direction by N semitones bakes the pitch change into
+    the embedding itself, so Kokoro synthesises at the target pitch natively without
+    any post-hoc audio transform.
+    """
+
+    MIN_VOICES = 8
+
+    def __init__(self) -> None:
+        self.direction: np.ndarray | None = None   # (D,) unit vector
+        self._semitone_scale: float = 1.0          # embedding delta per semitone
+        self.voice_count: int = 0
+        self.status: str = "Not loaded"
+
+    def build(self, analysis_csv: Path, voice_dir: Path) -> None:
+        import csv as _csv
+        try:
+            from sklearn.linear_model import Ridge
+        except ImportError:
+            self.status = "scikit-learn not installed  (pip install scikit-learn)"
+            return
+
+        embeddings: list[np.ndarray] = []
+        log_f0s: list[float] = []
+
+        try:
+            with open(analysis_csv, newline="", encoding="utf-8") as f:
+                for row in _csv.DictReader(f):
+                    voice_id = (row.get("id") or "").strip()
+                    f0_str   = (row.get("f0_hz") or "").strip()
+                    if not voice_id or not f0_str:
+                        continue
+                    try:
+                        f0 = float(f0_str)
+                    except ValueError:
+                        continue
+                    if f0 <= 0:
+                        continue
+                    bin_path = voice_dir / f"{voice_id}.bin"
+                    if not bin_path.exists():
+                        continue
+                    arr = np.fromfile(bin_path, dtype=np.float32)
+                    if arr.size == 0:
+                        continue
+                    embeddings.append(arr)
+                    log_f0s.append(float(np.log(f0)))
+        except OSError as exc:
+            self.status = f"Could not read CSV: {exc}"
+            return
+
+        if len(embeddings) < self.MIN_VOICES:
+            self.status = f"Too few voices with f0 data ({len(embeddings)} < {self.MIN_VOICES} needed)"
+            return
+
+        # Trim to common length — all stock Kokoro bins are the same size, but guard anyway.
+        min_size = min(e.size for e in embeddings)
+        X = np.array([e[:min_size] for e in embeddings])
+        y = np.array(log_f0s)
+
+        coef = Ridge(alpha=1.0).fit(X, y).coef_
+        norm = float(np.linalg.norm(coef))
+        if norm < 1e-12:
+            self.status = "Regression produced a zero vector — check CSV f0 values"
+            return
+
+        self.direction = coef / norm
+        # 1 semitone = log(2)/12 in log-Hz space.
+        # Moving along the unit direction by delta changes the prediction by delta * norm.
+        # So: delta_per_semitone = log(2) / (12 * norm)
+        self._semitone_scale = float(np.log(2)) / (12.0 * norm)
+        self.voice_count = len(embeddings)
+        self.status = f"Pitch axis ready — {self.voice_count} voices"
+
+    def shift(self, embedding: np.ndarray, semitones: float) -> np.ndarray:
+        """Return a copy of embedding shifted by semitones along the pitch axis."""
+        if self.direction is None or abs(semitones) < 1e-6:
+            return embedding
+        d = self.direction[:embedding.size]
+        return embedding + semitones * self._semitone_scale * d
+
+    @property
+    def available(self) -> bool:
+        return self.direction is not None
+
 
 class RatingData:
     def __init__(self) -> None:
@@ -369,6 +488,11 @@ class VoiceLabApp:
         self._server = PersistentSynthServer()
         self._precache_stop = threading.Event()
         self._precache_thread: threading.Thread | None = None
+        self.pitch_axis: PitchAxis = PitchAxis()
+        self.bake_pitch_var = tk.BooleanVar(value=False)
+        self.pitch_axis_status_var = tk.StringVar(value="Pitch axis: load a voice folder to initialise")
+        self._slot_info_vars = [tk.StringVar(value="—") for _ in range(3)]
+        self._acoustic: dict[str, dict] = {}
 
         # ── shared vars ──────────────────────────────────────────────────────
         self.status_var        = tk.StringVar(value="Load a voice folder to begin.")
@@ -763,6 +887,25 @@ class VoiceLabApp:
         self._precache_thread = threading.Thread(target=self._precache_all, daemon=True)
         self._precache_thread.start()
 
+    def recache_voices(self) -> None:
+        """Delete all cached preview WAVs and re-synthesise from scratch, then rebuild pitch axis."""
+        if not self._can_synthesize():
+            self.precache_var.set("Start server first.")
+            return
+        if self._precache_thread and self._precache_thread.is_alive():
+            self.precache_var.set("Cache already running.")
+            return
+        for f in PREVIEW_CACHE_DIR.glob("*.wav"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        def _run() -> None:
+            self._precache_all()
+            self.root.after(0, self._load_pitch_axis)
+        self._precache_thread = threading.Thread(target=_run, daemon=True)
+        self._precache_thread.start()
+
     def _server_start(self) -> None:
         if not SYNTH_SERVER_SCRIPT.exists():
             messagebox.showerror(APP_TITLE, f"synth_server.py not found at {SYNTH_SERVER_SCRIPT}")
@@ -811,131 +954,197 @@ class VoiceLabApp:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_mixer_tab(self, parent: ttk.Frame) -> None:
-        # ── library bar ──────────────────────────────────────────────────────
-        bar = ttk.LabelFrame(parent, text="Library", padding=(8, 4))
-        bar.pack(fill="x", pady=(0, 8))
-        ttk.Button(bar, text="Load Folder", command=self.select_voice_dir).grid(row=0, column=0)
-        ttk.Entry(bar, textvariable=self.voice_dir_var, width=55).grid(row=0, column=1, padx=(6, 4))
-        ttk.Button(bar, text="Reload", command=self.reload_voice_dir).grid(row=0, column=2)
-        ttk.Button(bar, text="Load Ratings", command=self.select_ratings_json).grid(row=0, column=3, padx=(12, 0))
-        ttk.Entry(bar, textvariable=self.ratings_path_var, width=28).grid(row=0, column=4, padx=(4, 0))
+        parent.rowconfigure(0, weight=0)
+        parent.rowconfigure(1, weight=1)
+        parent.rowconfigure(2, weight=0)
+        parent.rowconfigure(3, weight=0)
+        parent.columnconfigure(0, weight=1)
 
-        # ── slots + mix panel ────────────────────────────────────────────────
+        # ── library bar ──────────────────────────────────────────────────────
+        bar = ttk.Frame(parent, padding=(4, 4, 4, 4))
+        bar.grid(row=0, column=0, sticky="ew")
+        ttk.Button(bar, text="Load Folder", command=self.select_voice_dir).pack(side="left")
+        ttk.Entry(bar, textvariable=self.voice_dir_var, width=48).pack(side="left", padx=(6, 2))
+        ttk.Button(bar, text="Reload", command=self.reload_voice_dir).pack(side="left", padx=(0, 12))
+        ttk.Button(bar, text="Load Ratings", command=self.select_ratings_json).pack(side="left")
+        ttk.Entry(bar, textvariable=self.ratings_path_var, width=26).pack(side="left", padx=(6, 0))
+
+        # ── main area: slots fill all available height, mix panel docks right ──
         mid = ttk.Frame(parent)
-        mid.pack(fill="both", expand=True)
+        mid.grid(row=1, column=0, sticky="nsew", padx=4, pady=(4, 0))
+        for col in range(3):
+            mid.columnconfigure(col, weight=1)
+        mid.columnconfigure(3, weight=0)
+        mid.rowconfigure(0, weight=1)
 
         self.voice_dropdowns = []
         for i in range(3):
             self._build_slot(mid, i)
-
         self._build_mix_panel(mid)
 
-        ttk.Label(parent, text="¹ Speed affects preview only — not baked into exported .bin",
-                  foreground="#888", font=("Segoe UI", 8)).pack(anchor="w", padx=4, pady=(2, 0))
+        # ── watermark ────────────────────────────────────────────────────────
+        self._watermark_img = None
+        logo_path = APP_DIR / "logo.png"
+        if logo_path.exists():
+            try:
+                from PIL import Image, ImageTk
+                img = Image.open(logo_path).convert("RGBA")
+                img = img.resize((520, 520), Image.LANCZOS)
+                r, g, b, a = img.split()
+                a = a.point(lambda v: int(v * 0.08))
+                img.putalpha(a)
+                self._watermark_img = ImageTk.PhotoImage(img)
+                try:
+                    bg = ttk.Style().lookup("TFrame", "background") or "#f0f0f0"
+                except Exception:
+                    bg = "#f0f0f0"
+                wm = tk.Label(mid, image=self._watermark_img, bg=bg, bd=0, highlightthickness=0)
+                wm.place(relx=0.38, rely=0.5, anchor="center")
+                mid.after(100, wm.lower)
+            except Exception:
+                pass
+
+        # ── footnote ─────────────────────────────────────────────────────────
+        ttk.Label(parent,
+                  text="¹ Speed: preview only, not baked into .bin  "
+                       "² Bake pitch: shifts embedding along learned pitch axis — requires scikit-learn + voice-audition CSV",
+                  foreground="#999", font=("Segoe UI", 7),
+                  ).grid(row=2, column=0, sticky="w", padx=6, pady=(2, 0))
 
         # ── trait match assist ───────────────────────────────────────────────
-        ta = ttk.LabelFrame(parent, text="Trait Match Assist  (set target traits → suggest best voices)", padding=(8, 4))
-        ta.pack(fill="x", pady=(8, 0))
-        btn_row = ttk.Frame(ta)
-        btn_row.pack(fill="x", pady=(0, 4))
-        ttk.Button(btn_row, text="Suggest 3 Voices", command=self.suggest_from_traits).pack(side="left")
-        ttk.Label(btn_row, text="  Set target trait values, then click Suggest:",
-                  foreground="#666", font=("Segoe UI", 8)).pack(side="left")
+        ta = ttk.LabelFrame(parent, text="Trait Match Assist — set targets, click Suggest", padding=(8, 4))
+        ta.grid(row=3, column=0, sticky="ew", padx=4, pady=(6, 4))
+        ta.columnconfigure(1, weight=1)
+        ttk.Button(ta, text="Suggest 3 Voices", command=self.suggest_from_traits).grid(
+            row=0, column=0, padx=(0, 14), pady=2, sticky="w")
         self._traits_inner = ttk.Frame(ta)
-        self._traits_inner.pack(fill="x")
+        self._traits_inner.grid(row=0, column=1, sticky="ew")
         self._build_trait_assist_sliders(self._traits_inner)
 
     def _build_slot(self, parent: ttk.Frame, idx: int) -> None:
-        colors = ["#f0f4ff", "#f0fff4", "#fff8f0"]
-        sf = ttk.LabelFrame(parent, text=f"  Slot {idx + 1}  ", padding=(8, 6))
-        sf.pack(side="left", fill="both", expand=True, padx=(0, 6) if idx < 2 else 0)
+        sf = ttk.LabelFrame(parent, text=f"  Slot {idx + 1}  ", padding=(12, 10))
+        sf.grid(row=0, column=idx, sticky="nsew", padx=(0, 6) if idx < 2 else 0)
+        sf.columnconfigure(0, weight=1)
 
-        top = ttk.Frame(sf)
-        top.pack(fill="x")
-        ttk.Checkbutton(top, text="Active", variable=self.active_vars[idx],
-                        command=self._on_mix_change).pack(side="left")
+        # Active + combo
+        ttk.Checkbutton(sf, text="Active", variable=self.active_vars[idx],
+                        command=self._on_mix_change).grid(row=0, column=0, sticky="w")
         combo = ttk.Combobox(sf, textvariable=self.voice_vars[idx], state="readonly")
-        combo.pack(fill="x", pady=(4, 0))
-        combo.bind("<<ComboboxSelected>>", lambda _e: self._on_mix_change())
+        combo.grid(row=1, column=0, sticky="ew", pady=(4, 10))
+        combo.bind("<<ComboboxSelected>>", lambda _e, i=idx: (self._on_mix_change(), self._update_slot_info(i)))
         self.voice_dropdowns.append(combo)
 
-        def _row(label: str, var: tk.Variable, lo: float, hi: float, res: float, length: int = 0) -> None:
+        # Sliders
+        def _row(row: int, label: str, var: tk.Variable, lo: float, hi: float, res: float) -> None:
             rf = ttk.Frame(sf)
-            rf.pack(fill="x", pady=1)
-            ttk.Label(rf, text=label, width=7, anchor="e").pack(side="left")
-            sc = tk.Scale(rf, from_=lo, to=hi, orient="horizontal", resolution=res,
-                          variable=var, showvalue=False)
-            sc.pack(side="left", fill="x", expand=True, padx=4)
-            ttk.Spinbox(rf, from_=lo, to=hi, increment=res, textvariable=var, width=6).pack(side="left")
+            rf.grid(row=row, column=0, sticky="ew", pady=3)
+            rf.columnconfigure(1, weight=1)
+            ttk.Label(rf, text=label, width=8, anchor="e", font=("Segoe UI", 9)).grid(row=0, column=0)
+            tk.Scale(rf, from_=lo, to=hi, orient="horizontal", resolution=res,
+                     variable=var, showvalue=False, length=120,
+                     ).grid(row=0, column=1, sticky="ew", padx=(6, 4))
+            ttk.Spinbox(rf, from_=lo, to=hi, increment=res, textvariable=var,
+                        width=7, font=("Segoe UI", 9)).grid(row=0, column=2)
 
-        _row("Weight %", self.weight_vars[idx], 0, 100, 1)
-        _row("Pitch st", self.pitch_vars[idx], -12, 12, 0.5)
-        _row("Speed ¹", self.speed_vars[idx], 0.25, 2.0, 0.01)
+        _row(2, "Weight %", self.weight_vars[idx], 0, 100, 1)
+        _row(3, "Pitch st", self.pitch_vars[idx], -12, 12, 0.5)
+        _row(4, "Speed ¹",  self.speed_vars[idx], 0.25, 2.0, 0.01)
 
-        btn_row = ttk.Frame(sf)
-        btn_row.pack(fill="x", pady=(6, 0))
-        ttk.Button(btn_row, text="▶ Preview Slot",
-                   command=lambda i=idx: self.preview_slot(i)).pack(side="left")
-        ttk.Label(btn_row, textvariable=self.slot_status_vars[idx],
-                  font=("Segoe UI", 8), foreground="#555").pack(side="left", padx=(6, 0))
+        ttk.Separator(sf, orient="horizontal").grid(row=5, column=0, sticky="ew", pady=(12, 8))
+
+        # Acoustic info
+        ttk.Label(sf, textvariable=self._slot_info_vars[idx],
+                  font=("Segoe UI", 8), foreground="#446",
+                  justify="left").grid(row=6, column=0, sticky="w")
+
+        # Preview button + status
+        ttk.Button(sf, text="▶  Preview Slot",
+                   command=lambda i=idx: self.preview_slot(i),
+                   ).grid(row=7, column=0, sticky="ew", pady=(10, 2))
+        ttk.Label(sf, textvariable=self.slot_status_vars[idx],
+                  font=("Segoe UI", 8), foreground="#555",
+                  ).grid(row=8, column=0, sticky="w")
 
     def _build_mix_panel(self, parent: ttk.Frame) -> None:
-        mf = ttk.LabelFrame(parent, text="  Mix Output  ", padding=(8, 6))
-        mf.pack(side="left", fill="y", padx=(6, 0))
+        mf = ttk.LabelFrame(parent, text="  Mix Output  ", padding=(10, 8))
+        mf.grid(row=0, column=3, sticky="nsew", padx=(8, 0))
+        mf.columnconfigure(0, weight=1)
 
-        ttk.Label(mf, text="Mode", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        r = 0
+
+        # Mode
+        ttk.Label(mf, text="Mode", font=("Segoe UI", 8, "bold")).grid(row=r, column=0, sticky="w"); r += 1
         ttk.Radiobutton(mf, text="External synth", variable=self.preview_mode_var,
-                        value="external_cmd").pack(anchor="w")
+                        value="external_cmd").grid(row=r, column=0, sticky="w"); r += 1
         ttk.Radiobutton(mf, text="Asset check only", variable=self.preview_mode_var,
-                        value="direct_assets").pack(anchor="w")
+                        value="direct_assets").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Separator(mf, orient="horizontal").grid(row=r, column=0, sticky="ew", pady=6); r += 1
 
-        ttk.Separator(mf, orient="horizontal").pack(fill="x", pady=6)
-
-        # Global output speed + pitch (applied to the final blended synthesis)
+        # Output speed + pitch
+        ttk.Label(mf, text="Output", font=("Segoe UI", 8, "bold")).grid(row=r, column=0, sticky="w"); r += 1
         def _out_row(label: str, var: tk.Variable, lo: float, hi: float, res: float) -> None:
+            nonlocal r
             rf = ttk.Frame(mf)
-            rf.pack(fill="x", pady=1)
-            ttk.Label(rf, text=label, width=9, anchor="e").pack(side="left")
+            rf.grid(row=r, column=0, sticky="ew", pady=2); r += 1
+            rf.columnconfigure(1, weight=1)
+            ttk.Label(rf, text=label, width=8, anchor="e").grid(row=0, column=0)
             tk.Scale(rf, from_=lo, to=hi, orient="horizontal", resolution=res,
-                     variable=var, showvalue=False).pack(side="left", fill="x", expand=True, padx=4)
-            ttk.Spinbox(rf, from_=lo, to=hi, increment=res, textvariable=var, width=6).pack(side="left")
+                     variable=var, showvalue=False).grid(row=0, column=1, sticky="ew", padx=(4, 2))
+            ttk.Spinbox(rf, from_=lo, to=hi, increment=res, textvariable=var, width=6).grid(row=0, column=2)
+        _out_row("Speed",    self.mix_speed_var,  0.25, 2.0,   0.01)
+        _out_row("Pitch st", self.mix_pitch_var, -12.0, 12.0,  0.5)
+        ttk.Button(mf, text="Reset Output FX", command=self._reset_output_fx,
+                   ).grid(row=r, column=0, sticky="w", pady=(2, 0)); r += 1
+        ttk.Separator(mf, orient="horizontal").grid(row=r, column=0, sticky="ew", pady=6); r += 1
 
-        ttk.Label(mf, text="Output", font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        _out_row("Speed", self.mix_speed_var, 0.25, 2.0, 0.01)
-        _out_row("Pitch st", self.mix_pitch_var, -12.0, 12.0, 0.5)
-        ttk.Button(mf, text="Reset Output FX", command=self._reset_output_fx).pack(anchor="w", pady=(2, 0))
+        # Options
+        ttk.Checkbutton(mf, text="Auto-preview on save",
+                        variable=self.auto_preview_var).grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Checkbutton(mf, text="Sidecar preset JSON",
+                        variable=self.save_sidecar_var).grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Checkbutton(mf, text="Bake slot pitch into .bin ²",
+                        variable=self.bake_pitch_var).grid(row=r, column=0, sticky="w", pady=(4, 0)); r += 1
+        ttk.Label(mf, textvariable=self.pitch_axis_status_var,
+                  font=("Segoe UI", 7), foreground="#555",
+                  wraplength=200, justify="left").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Separator(mf, orient="horizontal").grid(row=r, column=0, sticky="ew", pady=6); r += 1
 
-        ttk.Separator(mf, orient="horizontal").pack(fill="x", pady=6)
-        ttk.Checkbutton(mf, text="Auto-preview on save", variable=self.auto_preview_var).pack(anchor="w")
-        ttk.Checkbutton(mf, text="Sidecar preset JSON", variable=self.save_sidecar_var).pack(anchor="w")
-
-        ttk.Separator(mf, orient="horizontal").pack(fill="x", pady=6)
-
+        # Export path
         ef = ttk.Frame(mf)
-        ef.pack(fill="x")
-        ttk.Label(ef, text="Export dir", font=("Segoe UI", 8)).grid(row=0, column=0, sticky="w")
-        ttk.Entry(ef, textvariable=self.export_dir_var, width=22).grid(row=0, column=1, padx=(4, 0))
+        ef.grid(row=r, column=0, sticky="ew"); r += 1
+        ef.columnconfigure(1, weight=1)
+        ttk.Label(ef, text="Dir",  font=("Segoe UI", 8), width=4, anchor="e").grid(row=0, column=0)
+        ttk.Entry(ef, textvariable=self.export_dir_var).grid(row=0, column=1, sticky="ew", padx=(4, 0))
         ttk.Button(ef, text="…", width=2, command=self.select_export_dir).grid(row=0, column=2, padx=(2, 0))
-        ttk.Label(ef, text="Name", font=("Segoe UI", 8)).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Entry(ef, textvariable=self.export_name_var, width=22).grid(row=1, column=1, padx=(4, 0), pady=(4, 0))
+        ttk.Label(ef, text="Name", font=("Segoe UI", 8), width=4, anchor="e").grid(row=1, column=0, pady=(4, 0))
+        ttk.Entry(ef, textvariable=self.export_name_var).grid(row=1, column=1, sticky="ew", padx=(4, 0), pady=(4, 0))
+        ttk.Separator(mf, orient="horizontal").grid(row=r, column=0, sticky="ew", pady=6); r += 1
 
-        ttk.Separator(mf, orient="horizontal").pack(fill="x", pady=6)
+        # Action buttons — 2-column grid
+        bf = ttk.Frame(mf)
+        bf.grid(row=r, column=0, sticky="ew"); r += 1
+        bf.columnconfigure(0, weight=1)
+        bf.columnconfigure(1, weight=1)
+        btns = [
+            ("▶  Preview Mix",     self.preview_mix,            0, 0, 2),
+            ("Export  .bin",       self.export_mix_bin_default,  1, 0, 1),
+            ("Save  .bin  As…",    self.save_mix_bin_as,         1, 1, 1),
+            ("Save Preset",        self.save_mix_preset,         2, 0, 1),
+            ("Load Preset",        self.load_mix_preset,         2, 1, 1),
+            ("Open Folder",        self.open_export_folder,      3, 0, 1),
+            ("■  Stop Audio",      self.stop_audio,              3, 1, 1),
+        ]
+        for text, cmd, br, bc, span in btns:
+            ttk.Button(bf, text=text, command=cmd).grid(
+                row=br, column=bc, columnspan=span, sticky="ew", padx=2, pady=2)
 
-        for label, cmd in [
-            ("▶  Preview Mix",      self.preview_mix),
-            ("Export  .bin",        self.export_mix_bin_default),
-            ("Save  .bin  As…",     self.save_mix_bin_as),
-            ("Save Preset JSON",    self.save_mix_preset),
-            ("Load Preset JSON",    self.load_mix_preset),
-            ("Open Export Folder",  self.open_export_folder),
-            ("■  Stop Audio",       self.stop_audio),
-        ]:
-            ttk.Button(mf, text=label, command=cmd).pack(fill="x", pady=2)
+        ttk.Separator(mf, orient="horizontal").grid(row=r, column=0, sticky="ew", pady=6); r += 1
 
-        ttk.Separator(mf, orient="horizontal").pack(fill="x", pady=6)
+        # Summary + position
         ttk.Label(mf, textvariable=self.summary_var, font=("Segoe UI", 8),
-                  wraplength=180, justify="left").pack(anchor="w")
-        ttk.Label(mf, textvariable=self.position_var, font=("Segoe UI", 9)).pack(anchor="w", pady=(4, 0))
+                  wraplength=200, justify="left").grid(row=r, column=0, sticky="w"); r += 1
+        ttk.Label(mf, textvariable=self.position_var,
+                  font=("Segoe UI", 9)).grid(row=r, column=0, sticky="w", pady=(4, 0))
 
     def _build_trait_assist_sliders(self, parent: ttk.Frame) -> None:
         for w in parent.winfo_children():
@@ -969,6 +1178,7 @@ class VoiceLabApp:
         ttk.Button(sv_row, text="▶  Start Server", command=self._server_start).pack(side="left")
         ttk.Button(sv_row, text="■  Stop", command=self._server_stop).pack(side="left", padx=(6, 0))
         ttk.Button(sv_row, text="Pre-cache All Voices", command=self.start_precache).pack(side="left", padx=(12, 0))
+        ttk.Button(sv_row, text="Re-cache All Voices", command=self.recache_voices).pack(side="left", padx=(6, 0))
         ttk.Label(sv_row, textvariable=self.server_status_var,
                   font=("Segoe UI", 9, "bold"), foreground="#0055aa").pack(side="left", padx=(12, 0))
         ttk.Label(sv_row, textvariable=self.precache_var,
@@ -1089,7 +1299,16 @@ class VoiceLabApp:
             raise RuntimeError("Select at least one active voice.")
         # Always normalize — mixed style tensors must be at expected scale for the ONNX model.
         # Unnormalized weights (e.g. 50+43=93×) produce out-of-distribution embeddings → silence.
-        arr = self.voice_lib.mix(comps, normalize=True)
+        if self.bake_pitch_var.get() and self.pitch_axis.available:
+            # Build a pitch-shift list parallel to _mix_components() — active slots only.
+            pitch_shifts = [
+                float(self.pitch_vars[i].get())
+                for i in range(3)
+                if self._get_slot_voice(i) is not None
+            ]
+            arr = self.voice_lib.mix_with_pitch_bake(comps, pitch_shifts, self.pitch_axis, normalize=True)
+        else:
+            arr = self.voice_lib.mix(comps, normalize=True)
         p = self.temp_dir / "mix_preview.bin"
         VoiceLibrary.save_bin(arr, p)
         return arr, p
@@ -1135,11 +1354,19 @@ class VoiceLabApp:
         name = self.export_name_var.get().strip() or "mixed_voice"
         return d / (name if name.endswith(".bin") else name + ".bin")
 
+    def _refresh_voice_dropdowns(self) -> None:
+        """Rescan the voice folder and update all dropdowns — called after export."""
+        if not self.voice_lib.root:
+            return
+        voices = self.voice_lib.load_dir(self.voice_lib.root)
+        names = [v.name for v in voices]
+        for combo in self.voice_dropdowns:
+            combo["values"] = names
+
     def _write_export(self, out: Path) -> None:
-        # Export also normalizes — exported bins are meant to be used with Kokoro and must be
-        # at the same scale as vendor voices. normalize_weights checkbox is respected but we
-        # also force normalize so the exported file actually works.
-        arr = self.voice_lib.mix(self._mix_components(), normalize=True)
+        # _build_mix_bin applies pitch baking when enabled and normalizes.
+        # Exported bins must be at the same scale as vendor voices — normalize is always on.
+        arr, _ = self._build_mix_bin()
         VoiceLibrary.save_bin(arr, out)
         if self.save_sidecar_var.get():
             out.with_suffix(".json").write_text(json.dumps(self._mix_preset_data(), indent=2))
@@ -1147,6 +1374,8 @@ class VoiceLabApp:
         if self.auto_preview_var.get():
             # speed/pitch captured by caller on main thread and passed through
             self._synth_and_play(out, self._export_speed, self._export_pitch, "mix_export")
+        # Refresh dropdowns on main thread so the new .bin appears immediately
+        self.root.after(0, self._refresh_voice_dropdowns)
 
     def _capture_export_fx(self) -> None:
         """Capture speed/pitch on the main thread before handing off to background."""
@@ -1243,6 +1472,48 @@ class VoiceLabApp:
     # Library / config loading
     # ─────────────────────────────────────────────────────────────────────────
 
+    def _update_slot_info(self, idx: int) -> None:
+        v = self._get_slot_voice(idx)
+        if v is None:
+            self._slot_info_vars[idx].set("—")
+            return
+        row = self._acoustic.get(v.name)
+        if not row:
+            self._slot_info_vars[idx].set(v.name)
+            return
+        f0   = row.get("f0_hz", "").strip()
+        desc = row.get("description", "").strip()
+        self._slot_info_vars[idx].set(f"{f0} Hz  ·  {desc}" if f0 and desc else f"{f0} Hz" if f0 else v.name)
+
+    def _load_pitch_axis(self) -> None:
+        """Build the pitch direction vector from the acoustic analysis CSV + loaded voice bins."""
+        import csv as _csv
+        axis = PitchAxis()
+        csv_path = DEFAULT_ANALYSIS_CSV_PATH
+        if not csv_path.exists():
+            axis.status = f"No analysis CSV found at {csv_path}"
+        elif self.voice_lib.root:
+            axis.build(csv_path, self.voice_lib.root)
+        else:
+            axis.status = "Load a voice folder first"
+        self.pitch_axis = axis
+        self.pitch_axis_status_var.set(f"Pitch axis: {axis.status}")
+        if axis.available:
+            self.bake_pitch_var.set(True)
+        # Load acoustic lookup for slot info labels
+        self._acoustic = {}
+        if csv_path.exists():
+            try:
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    for row in _csv.DictReader(f):
+                        vid = (row.get("id") or "").strip()
+                        if vid:
+                            self._acoustic[vid] = row
+            except OSError:
+                pass
+        for i in range(3):
+            self._update_slot_info(i)
+
     def _load_voice_dir(self, root: Path) -> None:
         self.voice_dir_var.set(str(root))
         self.direct_backend.configure(root)
@@ -1257,6 +1528,7 @@ class VoiceLabApp:
         self.status_var.set(f"Loaded {len(voices)} voices from {vdir.name}/")
         self._refresh_ratings_list()
         self._recompute_summary()
+        self._load_pitch_axis()
 
     def select_voice_dir(self) -> None:
         folder = filedialog.askdirectory(title="Select Kokoro asset root or voice folder")

@@ -12,11 +12,17 @@ A GUI tool for rating, blending, and previewing voices from the [Kokoro-82M](htt
 
 **Mixer tab** — Blend up to 3 voices by weight. Per-slot pitch and speed sliders let you audition each voice individually. Separate Output Speed (0.25–2.0×) and Output Pitch (±12 semitones) controls apply to the final blended preview and export. Export the result as a `.bin` file that Kokoro can use directly as a custom voice.
 
+**Bake slot pitch into .bin** — Checkbox in the Mixer tab. When enabled, per-slot pitch offsets are baked directly into the voice embeddings before blending, rather than applied as audio post-processing. The exported `.bin` will already contain the pitch-shifted voice — no ffmpeg required at inference time. Uses Ridge regression over the acoustic analysis CSV to find the pitch direction in embedding space.
+
 **Trait Match Assist** — Set target trait values and the tool suggests the 3 closest voices from your rated library. Uses the same axis scores, so suggestions get better the more voices you rate.
 
 **Persistent synth server** — Loads the ONNX model once on startup instead of reloading it every preview. Eliminates the cold-start delay (~3s per call without this). Uses GPU automatically if `onnxruntime-gpu` is installed.
 
-**Voice pre-cache** — After the server starts, all voice WAVs are generated in the background. Once cached, every preview in the Ratings tab is an instant click with no synthesis delay.
+**Voice pre-cache** — After the server starts, all voice WAVs are generated in the background. Once cached, every preview in the Ratings tab is an instant click with no synthesis delay. Use **Re-cache All Voices** in the Config tab to force regeneration (e.g. after changing the test sentence or adding new voices).
+
+**Acoustic slot info** — Each mixer slot shows the selected voice's measured F0 (Hz) and brightness ratio from the acoustic analysis CSV, so you know what you're blending before you preview.
+
+**Voice list auto-refresh** — After exporting a `.bin`, the voice dropdowns automatically rescan the voices folder. Newly exported voices are immediately available in all slots without restarting.
 
 ---
 
@@ -33,16 +39,17 @@ https://huggingface.co/hexgrad/Kokoro-82M/tree/main
 You need these files/folders placed **in the same directory as the scripts**:
 
 ```
-kokoro_voice_lab.py   ← this repo
-synth_server.py       ← this repo
-infer.py              ← this repo
-config.json           ← from HuggingFace
-tokenizer.json        ← from HuggingFace
-tokenizer_config.json ← from HuggingFace
+kokoro_voice_lab.py        ← this repo
+extend_voice_analysis.py   ← this repo
+synth_server.py            ← this repo
+infer.py                   ← this repo
+config.json                ← from HuggingFace
+tokenizer.json             ← from HuggingFace
+tokenizer_config.json      ← from HuggingFace
 onnx/
-  model_uint8.onnx    ← from HuggingFace
+  model_uint8.onnx         ← from HuggingFace
 voices/
-  af_alloy.bin        ← from HuggingFace
+  af_alloy.bin             ← from HuggingFace
   af_bella.bin
   ... (54 voices total)
 ```
@@ -50,15 +57,19 @@ voices/
 ### 2. Install Python dependencies
 
 ```bash
-pip install onnxruntime misaki[en] soundfile numpy pillow
+pip install onnxruntime misaki[en] soundfile numpy pillow scikit-learn
 ```
 
 For GPU support (optional — CUDA required):
 ```bash
-pip install onnxruntime-gpu misaki[en] soundfile numpy pillow
+pip install onnxruntime-gpu misaki[en] soundfile numpy pillow scikit-learn
 ```
 
-`ffmpeg` is optional — only needed if you use pitch shift or speed controls that deviate from default (pitch ≠ 0, speed ≠ 1.0). If you don't have it, leave those at their defaults and it's bypassed entirely.
+`ffmpeg` is optional — only needed if you use pitch shift or speed controls that deviate from default (pitch ≠ 0, speed ≠ 1.0) **and** the Bake slot pitch checkbox is **off**. With baking enabled, pitch is applied at the embedding level and ffmpeg is not required.
+
+`scikit-learn` is required for the Bake slot pitch feature (Ridge regression to build the pitch direction vector). If not installed, the checkbox is disabled and a status message explains why.
+
+`librosa` is optional — needed only for `extend_voice_analysis.py`.
 
 ### 3. Run
 
@@ -99,11 +110,38 @@ Blending mixes the raw voice embedding tensors (256-dim float32 vectors) by weig
 **Output Speed / Output Pitch** (in the Mix Output panel) control the final result — both for **▶ Preview Mix** and for the exported `.bin` synthesis. Use these to tune overall tempo and register of the blended voice.
 
 - Use **Reset Output FX** to snap both back to default (speed 1.0×, pitch 0 semitones).
-- All pitch and speed transforms use ffmpeg. **ffmpeg must be on your PATH** for any non-default value. At defaults (pitch 0, speed 1.0) ffmpeg is not called.
+- All pitch and speed transforms use ffmpeg. **ffmpeg must be on your PATH** for any non-default value. At defaults (pitch 0, speed 1.0) ffmpeg is not called. (Exception: if Bake slot pitch is enabled, per-slot pitch is applied to the embeddings and does not require ffmpeg.)
+
+### Bake slot pitch
+
+When the **Bake slot pitch into .bin** checkbox is on, each slot's pitch offset is applied directly to the voice embedding before blending. The export `.bin` already encodes the pitch shift — no ffmpeg is needed at playback time, and the pitch is permanent rather than a post-processing effect.
+
+How it works: `extend_voice_analysis.py` measures the F0 of each voice from its synthesised WAV. The tool runs Ridge regression over all measured voices (embedding → log F0) to find the direction in the 256-dim embedding space that corresponds to pitch change. Shifting a `.bin` N semitones means moving it `N * log(2)/12` units along this direction (properly scaled by the regression vector norm). The direction is computed once from the acoustic CSV on startup and reused for all exports.
+
+If `scikit-learn` is not installed, or the acoustic CSV has fewer than 10 voices with valid F0 measurements, the checkbox is shown as disabled with a status explaining the limitation.
 
 ### Exported `.bin` files
 
 Always normalized. Match the raw float32 format of the vendor voices and can be dropped into the `voices/` folder for use with any Kokoro-compatible tool. The sidecar JSON records the blend recipe so you can recreate it later.
+
+---
+
+## Extending voice analysis coverage
+
+The tool ships with acoustic analysis data for voices that were cached in the original run. If you have voices that are missing from the analysis CSV (or you've added custom `.bin` files), run:
+
+```bash
+pip install librosa
+python extend_voice_analysis.py
+```
+
+This script:
+1. Reads the existing `cache/voice-audition/voice-analysis.csv`
+2. Finds any `.bin` files in `voices/` that don't have entries
+3. Synthesises a test sentence for each missing voice using the ONNX model
+4. Runs acoustic analysis (F0 via pyin, RMS, ZCR, spectral centroid) and appends rows
+
+After running, restart Voice Lab (or click **Re-cache All Voices**) to rebuild the pitch axis with the extended data.
 
 ---
 
@@ -112,6 +150,7 @@ Always normalized. Match the raw float32 format of the vendor voices and can be 
 | File | Purpose |
 |------|---------|
 | `kokoro_voice_lab.py` | Main GUI application |
+| `extend_voice_analysis.py` | Extend voice-analysis.csv to cover all .bin files |
 | `synth_server.py` | Persistent synthesis server (model loaded once) |
 | `infer.py` | Standalone synthesis script (also used as fallback) |
 | `voice_lab_config.json` | Session config — auto-saved, contains your local paths |
@@ -132,7 +171,7 @@ The sidecar JSON (saved alongside the `.bin`) records what voices were blended a
 
 - The tool saves your config (paths, slot settings, session state) to `voice_lab_config.json` automatically. This file is gitignored by default since it contains your local paths.
 - `voice_ratings.json` is also gitignored — if you want to share your ratings with someone, commit it manually or send it directly.
-- The `preview_cache/` folder holds pre-generated WAVs keyed to the test sentence. Delete it to force regeneration (e.g. after changing the test sentence).
+- The `preview_cache/` folder holds pre-generated WAVs keyed to the test sentence. Delete it to force regeneration (e.g. after changing the test sentence). Or use **Re-cache All Voices** in the Config tab.
 - Ratings use a 1–5 scale on each axis. Trait Match distance is Manhattan distance across all rated axes.
 
 ---
@@ -145,8 +184,10 @@ The sidecar JSON (saved alongside the `.bin`) records what voices were blended a
 | `misaki[en]` | Yes | G2P phonemiser — converts text to phoneme tokens |
 | `soundfile` | Yes | WAV read/write |
 | `numpy` | Yes | Voice bin arithmetic and tensor operations |
+| `scikit-learn` | Recommended | Required for Bake slot pitch; gracefully disabled if absent |
 | `Pillow` | Recommended | Logo transparency support; gracefully absent otherwise |
-| `ffmpeg` | Optional | Required only for non-default pitch or speed values |
+| `librosa` | Optional | Required only for `extend_voice_analysis.py` |
+| `ffmpeg` | Optional | Required for non-default pitch/speed when bake is off |
 
 Python 3.10 or later.
 
@@ -165,6 +206,8 @@ This tool is built on the work of several projects:
 **[soundfile](https://python-soundfile.readthedocs.io/)** / **[libsndfile](https://libsndfile.github.io/libsndfile/)** — WAV I/O used for reading and writing synthesis output. soundfile is the Python wrapper; the underlying work is libsndfile by Erik de Castro Lopo.
 
 **[NumPy](https://numpy.org/)** — voice bin loading, tensor arithmetic, and weight normalization.
+
+**[scikit-learn](https://scikit-learn.org/)** — Ridge regression used to compute the pitch direction vector in voice embedding space for the Bake slot pitch feature.
 
 **[Pillow](https://python-pillow.org/)** — used for logo transparency and image handling in the GUI watermark.
 
