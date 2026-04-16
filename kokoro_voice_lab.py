@@ -530,8 +530,8 @@ class VoiceLabApp:
         self._vmatch_opt_cand:  list[tuple[str, float, float]] = []  # (name, weight, pitch_st)
         self._vmatch_opt_desc:  str = ""
         self._vmatch_opt_dist:  float = 999.0
-        self._vmatch_opt_speed: float = 1.0  # speed ratio calibrated to match reference pacing
-        self._vmatch_speed_var: tk.StringVar  # set in _build_voice_match_tab
+        self._vmatch_opt_speed: float = 1.0  # speed used internally by the optimiser
+        self._vmatch_speed_slider_var: tk.DoubleVar  # set in _build_voice_match_tab
 
         # ── shared vars ──────────────────────────────────────────────────────
         self.status_var        = tk.StringVar(value="Load a voice folder to begin.")
@@ -1430,10 +1430,22 @@ class VoiceLabApp:
         ttk.Button(ft_btns, text="→ Mixer",
                    command=self.vmatch_tune_load_to_mixer).pack(side="left", padx=(6, 0))
 
-        self._vmatch_speed_var = tk.StringVar(value="Speed: —")
-        ttk.Label(ft, textvariable=self._vmatch_speed_var,
-                  foreground="#666", font=("Segoe UI", 8),
-                  ).pack(anchor="w", pady=(3, 0))
+        self._vmatch_speed_slider_var = tk.DoubleVar(value=1.0)
+        spd_row = ttk.Frame(ft)
+        spd_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(spd_row, text="Preview speed:", font=("Segoe UI", 8)).pack(side="left")
+        _spd_lbl = ttk.Label(spd_row, text="1.00×", width=5, font=("Segoe UI", 8))
+        _spd_lbl.pack(side="right")
+        def _on_spd(*_):
+            _spd_lbl.config(text=f"{self._vmatch_speed_slider_var.get():.2f}×")
+        self._vmatch_speed_slider_var.trace_add("write", _on_spd)
+        tk.Scale(ft, variable=self._vmatch_speed_slider_var,
+                 from_=0.5, to=2.0, resolution=0.05, orient="horizontal",
+                 showvalue=False, length=220,
+                 ).pack(fill="x")
+        ttk.Label(ft, text="Auto-set from calibration — adjust if previews sound too fast/slow.",
+                  foreground="#888", font=("Segoe UI", 7), wraplength=340,
+                  ).pack(anchor="w")
 
         # Blend Explorer
         ex = ttk.LabelFrame(right, text="  Blend Explorer  ", padding=8)
@@ -2057,7 +2069,7 @@ class VoiceLabApp:
         if not self._can_synthesize():
             messagebox.showerror(APP_TITLE, "Start the server first.")
             return
-        spd = self._vmatch_opt_speed
+        spd = self._vmatch_speed_slider_var.get()
         self._run_bg(lambda: self._vmatch_synth_recipe(recipe, "vmatch_tune", speed=spd),
                      success="Playing Fine Tune blend")
 
@@ -2071,7 +2083,7 @@ class VoiceLabApp:
             return
         pitch = float(self._vmatch_tune_pitch_vars[idx].get())
         recipe: list[tuple[str, float, float]] = [(name, 1.0, pitch)]
-        spd = self._vmatch_opt_speed
+        spd = self._vmatch_speed_slider_var.get()
         self._run_bg(lambda: self._vmatch_synth_recipe(recipe, f"vmatch_tune_slot{idx}", speed=spd),
                      success=f"Playing slot {idx+1}: {name}")
 
@@ -2091,7 +2103,7 @@ class VoiceLabApp:
                     "source": "vmatch_fine_tune",
                     "components": [{"voice": n, "weight": round(w, 4), "pitch_st": p}
                                    for n, w, p in recipe],
-                    "matched_speed": round(self._vmatch_opt_speed, 3),
+                    "matched_speed": round(self._vmatch_speed_slider_var.get(), 3),
                 }, indent=2))
             self.last_export_path = out
             self.root.after(0, self._refresh_voice_dropdowns)
@@ -2205,7 +2217,7 @@ class VoiceLabApp:
             return
         variant = self._vmatch_explore_variants[idx]
         label = "ABC"[idx]
-        spd = self._vmatch_opt_speed
+        spd = self._vmatch_speed_slider_var.get()
         self._run_bg(lambda: self._vmatch_synth_recipe(variant, f"vmatch_explore_{label}", speed=spd),
                      success=f"Playing Explorer variant {label}")
 
@@ -2248,7 +2260,7 @@ class VoiceLabApp:
                     "source": "vmatch_blend_explorer",
                     "components": [{"voice": n, "weight": round(w, 4), "pitch_st": p}
                                    for n, w, p in recipe],
-                    "matched_speed": round(self._vmatch_opt_speed, 3),
+                    "matched_speed": round(self._vmatch_speed_slider_var.get(), 3),
                 }, indent=2))
             self.last_export_path = out
             self.root.after(0, self._refresh_voice_dropdowns)
@@ -3078,9 +3090,7 @@ class VoiceLabApp:
                         "end", f"  {rank:2}.  {name:<22}  dist={d:.2f}")
             # Populate Fine Tune panel from optimiser result
             self._vmatch_tune_from_cand(self._vmatch_opt_cand)
-            spd_label = (f"Speed: {opt_speed:.2f}×  (use this in Mixer Output Speed to match "
-                         f"reference pacing — baked into previews, not the .bin)")
-            self._vmatch_speed_var.set(spd_label)
+            self._vmatch_speed_slider_var.set(opt_speed)
         self.root.after(0, finish)
 
     def vmatch_optimise(self) -> None:
