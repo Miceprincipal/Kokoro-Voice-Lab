@@ -43,14 +43,14 @@ VOICE_MATCH_COVERAGE = (
 DEFAULT_TRAIT_LABELS = ["age", "authority", "clarity", "energy", "gender_pres", "pitch", "roughness", "warmth"]
 
 TRAIT_DESC = {
-    "age":         ("1 = child", "5 = elderly"),
-    "authority":   ("1 = passive", "5 = commanding"),
-    "clarity":     ("1 = mumbly", "5 = crisp"),
-    "energy":      ("1 = drowsy", "5 = intense"),
-    "gender_pres": ("1 = masc", "5 = fem"),
-    "pitch":       ("1 = deep", "5 = high"),
-    "roughness":   ("1 = smooth", "5 = gravelly"),
-    "warmth":      ("1 = cold", "5 = warm"),
+    "age":         ("1 = child", "10 = elderly"),
+    "authority":   ("1 = passive", "10 = commanding"),
+    "clarity":     ("1 = mumbly", "10 = crisp"),
+    "energy":      ("1 = drowsy", "10 = intense"),
+    "gender_pres": ("1 = masc", "10 = fem"),
+    "pitch":       ("1 = deep", "10 = high"),
+    "roughness":   ("1 = smooth", "10 = gravelly"),
+    "warmth":      ("1 = cold", "10 = warm"),
 }
 
 
@@ -509,6 +509,29 @@ class VoiceLabApp:
         self._vmatch_scores: list[tuple[float, str]] = []
         self._vmatch_results_listbox: tk.Listbox | None = None
         self._vmatch_transcript_widget: tk.Text | None = None
+        # Fine Tune panel
+        self._vmatch_tune_voice_vars: list[tk.StringVar] = [tk.StringVar(value="") for _ in range(3)]
+        self._vmatch_tune_weight_vars: list[tk.DoubleVar] = [tk.DoubleVar(value=0.0) for _ in range(3)]
+        self._vmatch_tune_pitch_vars: list[tk.DoubleVar] = [tk.DoubleVar(value=0.0) for _ in range(3)]
+        self._vmatch_tune_combos: list = []
+        # Blend Explorer (replaces A/B tournament)
+        self._vmatch_explore_baseline: list[tuple[str, float, float]] = []
+        self._vmatch_explore_variants: list[list[tuple[str, float, float]]] = []
+        self._vmatch_explore_round = 0
+        self._vmatch_explore_round_var = tk.StringVar(
+            value="Set Fine Tune slots above, then Start Explorer")
+        self._vmatch_explore_a_var = tk.StringVar(value="▶  A")
+        self._vmatch_explore_b_var = tk.StringVar(value="▶  B")
+        self._vmatch_explore_c_var = tk.StringVar(value="▶  C")
+        self._vmatch_explore_btns: list[tk.Widget] = []  # play-A, play-B, play-C, pick-A, pick-B, pick-C
+        self._vmatch_status_label: ttk.Label | None = None
+        # Optimiser result
+        self._vmatch_opt_emb:   np.ndarray | None = None
+        self._vmatch_opt_cand:  list[tuple[str, float, float]] = []  # (name, weight, pitch_st)
+        self._vmatch_opt_desc:  str = ""
+        self._vmatch_opt_dist:  float = 999.0
+        self._vmatch_opt_speed: float = 1.0  # speed ratio calibrated to match reference pacing
+        self._vmatch_speed_var: tk.StringVar  # set in _build_voice_match_tab
 
         # ── shared vars ──────────────────────────────────────────────────────
         self.status_var        = tk.StringVar(value="Load a voice folder to begin.")
@@ -746,14 +769,14 @@ class VoiceLabApp:
                           font=("Segoe UI", 9, "bold")).grid(row=row, column=0, sticky="w", pady=3)
                 ttk.Label(col_frame, text=lo, foreground="#888",
                           font=("Segoe UI", 8)).grid(row=row, column=1, sticky="e")
-                var = tk.IntVar(value=3)
+                var = tk.IntVar(value=5)
                 self.rating_trait_vars[name] = var
-                tk.Scale(col_frame, from_=1, to=5, orient="horizontal", resolution=1,
+                tk.Scale(col_frame, from_=1, to=10, orient="horizontal", resolution=1,
                          variable=var, length=160, showvalue=False).grid(row=row, column=2,
                                                                           sticky="ew", padx=4, pady=3)
                 ttk.Label(col_frame, text=hi, foreground="#888",
                           font=("Segoe UI", 8)).grid(row=row, column=3, sticky="w")
-                ttk.Spinbox(col_frame, from_=1, to=5, increment=1,
+                ttk.Spinbox(col_frame, from_=1, to=10, increment=1,
                             textvariable=var, width=4).grid(row=row, column=4,
                                                              sticky="w", padx=(4, 0))
             col_frame.columnconfigure(2, weight=1)
@@ -769,7 +792,7 @@ class VoiceLabApp:
         self.ratings_sel_var.set(name)
         traits = self.ratings.get_traits(name)
         for k, var in self.rating_trait_vars.items():
-            var.set(int(traits.get(k, 3)))
+            var.set(int(traits.get(k, 5)))
         if self._ratings_notes:
             self._ratings_notes.delete("1.0", "end")
             self._ratings_notes.insert("1.0", self.ratings.get_notes(name))
@@ -798,6 +821,12 @@ class VoiceLabApp:
         notes = self._ratings_notes.get("1.0", "end").strip() if self._ratings_notes else ""
         self.ratings.set_traits(name, traits)
         self.ratings.set_notes(name, notes)
+        # Save to disk immediately so navigation never loses data
+        path = Path(self.ratings_path_var.get().strip() or str(DEFAULT_RATINGS_PATH))
+        try:
+            self.ratings.save(path)
+        except Exception:
+            pass
 
     def _ratings_save_current(self) -> None:
         name = self.ratings_sel_var.get().strip()
@@ -1177,12 +1206,12 @@ class VoiceLabApp:
             lo, hi = TRAIT_DESC.get(name, ("1", "5"))
             ttk.Label(col, text=name, font=("Segoe UI", 8, "bold"), anchor="center").pack()
             ttk.Label(col, text=lo, foreground="#888", font=("Segoe UI", 7)).pack()
-            var = tk.IntVar(value=3)
+            var = tk.IntVar(value=5)
             self.target_trait_vars[name] = var
-            tk.Scale(col, from_=1, to=5, orient="vertical", resolution=1,
+            tk.Scale(col, from_=1, to=10, orient="vertical", resolution=1,
                      variable=var, length=60, showvalue=False).pack()
             ttk.Label(col, text=hi, foreground="#888", font=("Segoe UI", 7)).pack()
-            ttk.Spinbox(col, from_=1, to=5, increment=1, textvariable=var, width=3).pack()
+            ttk.Spinbox(col, from_=1, to=10, increment=1, textvariable=var, width=3).pack()
 
     # ─────────────────────────────────────────────────────────────────────────
     # Config tab
@@ -1231,35 +1260,42 @@ class VoiceLabApp:
     # ─────────────────────────────────────────────────────────────────────────
 
     def _build_voice_match_tab(self, parent: ttk.Frame) -> None:
-        # ── Module status ─────────────────────────────────────────────────────
-        mod = ttk.LabelFrame(parent, text="  Module Status  ", padding=10)
-        mod.pack(fill="x", pady=(0, 8))
+        # ── Module status — full width at top ─────────────────────────────────
+        mod = ttk.LabelFrame(parent, text="  Module Status  ", padding=8)
+        mod.pack(fill="x", pady=(0, 6))
         mod.columnconfigure(1, weight=1)
 
         ttk.Label(mod, text="Dependencies:").grid(row=0, column=0, sticky="w")
         ttk.Label(mod, textvariable=self._vmatch_deps_var,
                   foreground="#555", font=("Segoe UI", 8)).grid(row=0, column=1, sticky="w", padx=(8, 0))
 
-        ttk.Label(mod, text="Fingerprints:").grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(mod, textvariable=self._vmatch_status_var,
-                  foreground="#555").grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Label(mod, text="Fingerprints:").grid(row=1, column=0, sticky="w", pady=(2, 0))
+        sl = ttk.Label(mod, textvariable=self._vmatch_status_var, foreground="#555")
+        sl.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
+        self._vmatch_status_label = sl
 
         btn_row = ttk.Frame(mod)
-        btn_row.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        btn_row.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
         ttk.Button(btn_row, text="Build Fingerprints",
                    command=self.vmatch_build).pack(side="left")
         ttk.Label(btn_row, textvariable=self._vmatch_progress_var,
-                  foreground="#666", font=("Segoe UI", 8)).pack(side="left", padx=(10, 0))
+                  foreground="#666", font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
 
-        ttk.Label(mod,
-                  text="Synthesises a phonetically-balanced sentence for each voice, extracts MFCC fingerprints. "
-                       "Server must be running. One-time cost; saved to voice_match_mfcc.json.",
-                  foreground="#888", font=("Segoe UI", 8), wraplength=700, justify="left",
-                  ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        # ── Two-column body ───────────────────────────────────────────────────
+        body = ttk.Frame(parent)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2, minsize=380)
+        body.rowconfigure(0, weight=1)
 
-        # ── Reference audio ───────────────────────────────────────────────────
-        ref = ttk.LabelFrame(parent, text="  Reference Audio  ", padding=10)
-        ref.pack(fill="x", pady=(0, 8))
+        # ── LEFT: file picker + match results ─────────────────────────────────
+        left = ttk.Frame(body)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+
+        ref = ttk.LabelFrame(left, text="  Reference Audio  ", padding=8)
+        ref.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ref.columnconfigure(1, weight=1)
 
         ttk.Label(ref, text="File:").grid(row=0, column=0, sticky="w")
@@ -1267,39 +1303,183 @@ class VoiceLabApp:
             row=0, column=1, sticky="ew", padx=(8, 0))
         ttk.Button(ref, text="Browse…",
                    command=self.vmatch_select_ref).grid(row=0, column=2, padx=(6, 0))
+        ttk.Button(ref, text="▶  Play",
+                   command=self.vmatch_play_reference).grid(row=0, column=3, padx=(4, 0))
 
-        ttk.Label(ref, text="Transcript:").grid(row=1, column=0, sticky="nw", pady=(8, 0))
-        tx = tk.Text(ref, height=3, width=60, wrap="word", font=("Segoe UI", 9))
-        tx.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
-        self._vmatch_transcript_widget = tx
-        ttk.Button(ref, text="Transcribe (Whisper)",
-                   command=self.vmatch_transcribe).grid(row=1, column=2, sticky="n", padx=(6, 0), pady=(8, 0))
+        res = ttk.LabelFrame(left, text="  Match Results  ", padding=8)
+        res.grid(row=1, column=0, sticky="nsew")
 
-        ttk.Label(ref,
-                  text="Transcript is informational only — matching uses MFCC statistics, not text content. "
-                       "Requires faster-whisper or openai-whisper.",
-                  foreground="#888", font=("Segoe UI", 8), wraplength=700, justify="left",
-                  ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 0))
-
-        # ── Results ───────────────────────────────────────────────────────────
-        res = ttk.LabelFrame(parent, text="  Match Results  ", padding=10)
-        res.pack(fill="both", expand=True)
-
-        lb = tk.Listbox(res, height=8, font=("Consolas", 9), activestyle="none",
+        lb = tk.Listbox(res, height=7, font=("Consolas", 9), activestyle="none",
                         selectmode="browse")
-        lb.pack(fill="x", pady=(0, 8))
+        lb.pack(fill="x", pady=(0, 6))
         self._vmatch_results_listbox = lb
 
         act_row = ttk.Frame(res)
-        act_row.pack(anchor="w")
+        act_row.pack(fill="x", pady=(0, 2))
         ttk.Button(act_row, text="Find Match",
                    command=self.vmatch_find_match).pack(side="left")
-        ttk.Button(act_row, text="Load Top 3 → Mixer",
-                   command=self.vmatch_load_to_mixer).pack(side="left", padx=(8, 0))
-        ttk.Button(act_row, text="Export Direct",
-                   command=self.vmatch_export_direct).pack(side="left", padx=(8, 0))
+        ttk.Button(act_row, text="Optimise Blend",
+                   command=self.vmatch_optimise).pack(side="left", padx=(8, 0))
+        ttk.Button(act_row, text="▶  Preview",
+                   command=self.vmatch_preview_result).pack(side="left", padx=(8, 0))
         ttk.Button(act_row, text="■  Stop",
-                   command=self.stop_audio).pack(side="right", padx=(16, 0))
+                   command=self.stop_audio).pack(side="right")
+
+        opt_row = ttk.Frame(res)
+        opt_row.pack(fill="x", pady=(2, 0))
+        ttk.Button(opt_row, text="Load Match → Mixer",
+                   command=self.vmatch_load_to_mixer).pack(side="left")
+        ttk.Button(opt_row, text="Load Optimised → Mixer",
+                   command=self.vmatch_load_opt_to_mixer).pack(side="left", padx=(8, 0))
+
+        ttk.Label(res,
+                  text=(
+                      "1.  Browse to a reference WAV or MP3.  ▶ Play to audition it.\n"
+                      "2.  Transcribe (Whisper) or paste the spoken text — used for synthesis during matching.\n"
+                      "3.  Find Match — F0-gates the pool by pitch, then ranks all voices by MFCC distance.\n"
+                      "4.  Optimise Blend — synthesises candidates, hill-climbs weights/pitch against your\n"
+                      "       reference audio, then runs a fine local pass.  Result loads into Fine Tune.\n"
+                      "5.  Fine Tune — tweak per-slot weight and pitch, ▶ preview each slot or the full blend,\n"
+                      "       Export or send to Mixer.  Weight labels show normalised contribution %.\n"
+                      "6.  Blend Explorer — each round injects 3 pool voices (18%) into your current blend.\n"
+                      "       Play A / B / C, pick the closest — Fine Tune updates, repeat to converge."
+                  ),
+                  foreground="#888", font=("Segoe UI", 8), justify="left",
+                  ).pack(anchor="w", pady=(10, 0))
+
+        # ── RIGHT: transcript + Fine Tune + Blend Explorer ────────────────────
+        right = ttk.Frame(body)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+
+        # Transcript
+        tx_frame = ttk.LabelFrame(right, text="  Transcript  ", padding=8)
+        tx_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        tx_frame.columnconfigure(0, weight=1)
+
+        tx = tk.Text(tx_frame, height=4, wrap="word", font=("Segoe UI", 9))
+        tx.grid(row=0, column=0, sticky="ew")
+        self._vmatch_transcript_widget = tx
+        ttk.Button(tx_frame, text="Transcribe (Whisper)",
+                   command=self.vmatch_transcribe).grid(row=0, column=1, sticky="n", padx=(6, 0))
+        ttk.Label(tx_frame,
+                  text="Matching uses MFCC, not text. Transcript is used for synthesis during re-rank and preview.",
+                  foreground="#888", font=("Segoe UI", 8), wraplength=340,
+                  ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        # Fine Tune
+        ft = ttk.LabelFrame(right, text="  Fine Tune  ", padding=8)
+        ft.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ft.columnconfigure(0, weight=1)
+
+        voice_names = [v.name for v in self.voice_lib.voices] or [""]
+        self._vmatch_tune_combos = []
+        _tune_w_labels: list[ttk.Label] = []
+
+        def _refresh_weight_labels(*_: object) -> None:
+            """Recompute normalised % for all three weight labels whenever any changes."""
+            vals = [float(v.get()) for v in self._vmatch_tune_weight_vars]
+            total = sum(v for v in vals if v > 0) or 1.0
+            for lbl, v in zip(_tune_w_labels, vals):
+                lbl.config(text=f"{v / total * 100:.0f}%")
+
+        for i in range(3):
+            slot_row = ttk.Frame(ft)
+            slot_row.pack(fill="x", pady=1)
+            ttk.Label(slot_row, text=f"S{i+1}:", width=3).pack(side="left")
+            cb = ttk.Combobox(slot_row, textvariable=self._vmatch_tune_voice_vars[i],
+                              values=voice_names, width=16, state="readonly")
+            cb.pack(side="left")
+            self._vmatch_tune_combos.append(cb)
+            ttk.Label(slot_row, text=" W:").pack(side="left")
+            tk.Scale(slot_row, variable=self._vmatch_tune_weight_vars[i],
+                     from_=0, to=100, resolution=1, orient="horizontal",
+                     length=80, showvalue=False).pack(side="left")
+            w_lbl = ttk.Label(slot_row, width=4)
+            w_lbl.pack(side="left")
+            _tune_w_labels.append(w_lbl)
+            self._vmatch_tune_weight_vars[i].trace_add("write", _refresh_weight_labels)
+            ttk.Label(slot_row, text=" P:").pack(side="left")
+            tk.Scale(slot_row, variable=self._vmatch_tune_pitch_vars[i],
+                     from_=-5, to=5, resolution=0.5, orient="horizontal",
+                     length=70, showvalue=False).pack(side="left")
+            p_lbl = ttk.Label(slot_row, width=6)
+            p_lbl.pack(side="left")
+            def _p_trace(_, __, ___, lbl=p_lbl, var=self._vmatch_tune_pitch_vars[i]):
+                lbl.config(text=f"{var.get():+.1f}st")
+            self._vmatch_tune_pitch_vars[i].trace_add("write", _p_trace)
+            _p_trace(None, None, None)
+            ttk.Button(slot_row, text="▶", width=2,
+                       command=lambda idx=i: self.vmatch_tune_preview_slot(idx)
+                       ).pack(side="left", padx=(4, 0))
+
+        _refresh_weight_labels()  # initialise labels
+
+        ft_name_row = ttk.Frame(ft)
+        ft_name_row.pack(fill="x", pady=(6, 0))
+        ttk.Label(ft_name_row, text="Export name:", font=("Segoe UI", 8)).pack(side="left")
+        ttk.Entry(ft_name_row, textvariable=self.export_name_var, width=22).pack(
+            side="left", padx=(4, 0))
+
+        ft_btns = ttk.Frame(ft)
+        ft_btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(ft_btns, text="▶  Preview",
+                   command=self.vmatch_tune_preview).pack(side="left")
+        ttk.Button(ft_btns, text="Export .bin",
+                   command=self.vmatch_tune_export).pack(side="left", padx=(6, 0))
+        ttk.Button(ft_btns, text="→ Mixer",
+                   command=self.vmatch_tune_load_to_mixer).pack(side="left", padx=(6, 0))
+
+        self._vmatch_speed_var = tk.StringVar(value="Speed: —")
+        ttk.Label(ft, textvariable=self._vmatch_speed_var,
+                  foreground="#666", font=("Segoe UI", 8),
+                  ).pack(anchor="w", pady=(3, 0))
+
+        # Blend Explorer
+        ex = ttk.LabelFrame(right, text="  Blend Explorer  ", padding=8)
+        ex.grid(row=2, column=0, sticky="ew")
+        ex.columnconfigure(0, weight=1)
+
+        ttk.Label(ex, textvariable=self._vmatch_explore_round_var,
+                  foreground="#444", font=("Segoe UI", 8), wraplength=360,
+                  ).pack(anchor="w")
+
+        ex_play_row = ttk.Frame(ex)
+        ex_play_row.pack(fill="x", pady=(6, 2))
+        ex_btn_a = ttk.Button(ex_play_row, textvariable=self._vmatch_explore_a_var,
+                              command=lambda: self.vmatch_explore_play(0), state="disabled")
+        ex_btn_a.pack(fill="x", pady=1)
+        ex_btn_b = ttk.Button(ex_play_row, textvariable=self._vmatch_explore_b_var,
+                              command=lambda: self.vmatch_explore_play(1), state="disabled")
+        ex_btn_b.pack(fill="x", pady=1)
+        ex_btn_c = ttk.Button(ex_play_row, textvariable=self._vmatch_explore_c_var,
+                              command=lambda: self.vmatch_explore_play(2), state="disabled")
+        ex_btn_c.pack(fill="x", pady=1)
+
+        ex_act_row = ttk.Frame(ex)
+        ex_act_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(ex_act_row, text="Start Explorer",
+                   command=self.vmatch_explore_start).pack(side="left")
+        ttk.Button(ex_act_row, text="Export",
+                   command=self.vmatch_explore_export).pack(side="left", padx=(6, 0))
+        ttk.Separator(ex_act_row, orient="vertical").pack(side="left", fill="y", padx=8)
+        ex_pick_a = ttk.Button(ex_act_row, text="Pick A",
+                               command=lambda: self.vmatch_explore_pick(0), state="disabled")
+        ex_pick_a.pack(side="left")
+        ex_pick_b = ttk.Button(ex_act_row, text="Pick B",
+                               command=lambda: self.vmatch_explore_pick(1), state="disabled")
+        ex_pick_b.pack(side="left", padx=(4, 0))
+        ex_pick_c = ttk.Button(ex_act_row, text="Pick C",
+                               command=lambda: self.vmatch_explore_pick(2), state="disabled")
+        ex_pick_c.pack(side="left", padx=(4, 0))
+
+        self._vmatch_explore_btns = [ex_btn_a, ex_btn_b, ex_btn_c, ex_pick_a, ex_pick_b, ex_pick_c]
+
+        ttk.Label(ex,
+                  text="Generates 3 blend variants (lean toward each voice / add a third). "
+                       "Play, Pick the closest — Fine Tune updates. Repeat to converge.",
+                  foreground="#888", font=("Segoe UI", 8), wraplength=360,
+                  ).pack(anchor="w", pady=(4, 0))
 
         # populate dep status on build
         self.root.after(100, self._vmatch_refresh_deps)
@@ -1329,60 +1509,87 @@ class VoiceLabApp:
 
     def _vmatch_load_cached_fingerprints(self) -> None:
         if not VOICE_MATCH_MFCC_PATH.exists():
-            self._vmatch_status_var.set("Not built — click Build Fingerprints")
+            self._vmatch_set_status("Not built — click Build Fingerprints")
             return
         try:
             data = json.loads(VOICE_MATCH_MFCC_PATH.read_text(encoding="utf-8"))
             self._vmatch_mfcc_db = data.get("voices", {})
             valid = sum(1 for v in self._vmatch_mfcc_db.values() if "mean" in v)
             total = len(self._vmatch_mfcc_db)
-            self._vmatch_status_var.set(f"Ready — {valid}/{total} voices fingerprinted")
+            self._vmatch_set_status(f"Ready — {valid}/{total} voices fingerprinted")
         except Exception as exc:
-            self._vmatch_status_var.set(f"Could not load: {exc}")
+            self._vmatch_set_status(f"Could not load: {exc}", error=True)
+
+    def _vmatch_set_status(self, msg: str, error: bool = False) -> None:
+        """Update the fingerprint status label — red+large on error, normal otherwise."""
+        self._vmatch_status_var.set(msg)
+        if self._vmatch_status_label:
+            if error:
+                self._vmatch_status_label.config(
+                    foreground="#cc0000", font=("Segoe UI", 11, "bold"))
+            else:
+                self._vmatch_status_label.config(
+                    foreground="#555", font=("Segoe UI", 9))
 
     def _vmatch_build_worker(self) -> None:
         """Background: synthesise coverage sentence for all voices, extract MFCCs, save JSON."""
+        def _status(msg: str, error: bool = False) -> None:
+            self.root.after(0, lambda m=msg, e=error: self._vmatch_set_status(m, e))
+            self.root.after(0, lambda m=msg: self.status_var.set(m))
+
+        def _prog(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self._vmatch_progress_var.set(m))
+
         try:
             import librosa
         except ImportError:
-            self.root.after(0, lambda: self._vmatch_status_var.set(
-                "librosa not installed — pip install librosa"))
-            return
-
-        if not self._can_synthesize():
-            self.root.after(0, lambda: self._vmatch_progress_var.set("Start server first."))
+            _status("librosa not installed — pip install librosa", error=True)
+            _prog("")
             return
 
         voices = list(self.voice_lib.voices)
+        if not voices:
+            _status("No voices loaded — load a voice folder first", error=True)
+            _prog("")
+            return
+
         total = len(voices)
         db: dict[str, dict] = {}
         tmp = self.temp_dir / "_vmatch_cov.wav"
+        fail_count = 0
 
-        for i, v in enumerate(voices, 1):
-            try:
-                self._do_synthesize(v.path, VOICE_MATCH_COVERAGE, tmp)
-                y, sr = librosa.load(str(tmp), sr=22050, mono=True)
-                mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-                db[v.name] = {
-                    "mean": mfcc.mean(axis=1).tolist(),
-                    "std":  mfcc.std(axis=1).tolist(),
-                }
-            except Exception as exc:
-                db[v.name] = {"error": str(exc)}
-            n = i
-            self.root.after(0, lambda n=n, t=total: self._vmatch_progress_var.set(
-                f"Building {n}/{t}…"))
+        try:
+            for i, v in enumerate(voices, 1):
+                prog_msg = f"Fingerprinting {i}/{total}: {v.name}"
+                _prog(prog_msg)
+                _status(prog_msg)
+                try:
+                    self._do_synthesize(v.path, VOICE_MATCH_COVERAGE, tmp)
+                    y, sr = librosa.load(str(tmp), sr=22050, mono=True)
+                    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+                    db[v.name] = {
+                        "mean": mfcc.mean(axis=1).tolist(),
+                        "std":  mfcc.std(axis=1).tolist(),
+                    }
+                except Exception as exc:
+                    db[v.name] = {"error": str(exc)}
+                    fail_count += 1
 
-        valid = sum(1 for fp in db.values() if "mean" in fp)
-        VOICE_MATCH_MFCC_PATH.write_text(json.dumps({
-            "coverage_sentence": VOICE_MATCH_COVERAGE,
-            "voices": db,
-        }, indent=2), encoding="utf-8")
-        self._vmatch_mfcc_db = db
-        msg = f"Ready — {valid}/{total} voices fingerprinted"
-        self.root.after(0, lambda: self._vmatch_status_var.set(msg))
-        self.root.after(0, lambda: self._vmatch_progress_var.set(""))
-        self.root.after(0, lambda: self.status_var.set(msg))
+            valid = sum(1 for fp in db.values() if "mean" in fp)
+            VOICE_MATCH_MFCC_PATH.write_text(json.dumps({
+                "coverage_sentence": VOICE_MATCH_COVERAGE,
+                "voices": db,
+            }, indent=2), encoding="utf-8")
+            self._vmatch_mfcc_db = db
+            msg = f"Ready — {valid}/{total} voices fingerprinted"
+            if fail_count:
+                msg += f"  ({fail_count} failed — check server is running)"
+            _status(msg)
+            _prog("")
+
+        except Exception as exc:
+            _status(f"Build failed: {exc}", error=True)
+            _prog("")
 
     def vmatch_build(self) -> None:
         if not self._require_voices():
@@ -1394,6 +1601,27 @@ class VoiceLabApp:
         self._vmatch_progress_var.set("")
         threading.Thread(target=self._vmatch_build_worker, daemon=True).start()
 
+    @staticmethod
+    def _vmatch_transcript_path(audio_path: str) -> Path:
+        return Path(audio_path).with_suffix(".txt")
+
+    def _vmatch_load_transcript_if_exists(self, audio_path: str) -> bool:
+        """Load sidecar .txt if present. Returns True if loaded."""
+        txt = self._vmatch_transcript_path(audio_path)
+        if not txt.exists():
+            return False
+        try:
+            text = txt.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        if not text:
+            return False
+        if self._vmatch_transcript_widget:
+            self._vmatch_transcript_widget.delete("1.0", "end")
+            self._vmatch_transcript_widget.insert("1.0", text)
+        self.status_var.set(f"Transcript loaded from {txt.name}")
+        return True
+
     def vmatch_select_ref(self) -> None:
         path = filedialog.askopenfilename(
             title="Select reference audio",
@@ -1401,6 +1629,38 @@ class VoiceLabApp:
         )
         if path:
             self._vmatch_ref_var.set(path)
+            self._vmatch_load_transcript_if_exists(path)
+
+    def vmatch_play_reference(self) -> None:
+        path = self._vmatch_ref_var.get().strip()
+        if not path or not Path(path).exists():
+            self.status_var.set("No reference audio file selected.")
+            return
+        # Decode via soundfile/librosa → temp WAV so any format (MP3, FLAC, …) works
+        # regardless of whether pygame or winsound is driving playback.
+        def task() -> None:
+            import soundfile as sf
+            try:
+                y, sr = sf.read(path, always_2d=False)
+            except Exception:
+                try:
+                    import librosa
+                    y, sr = librosa.load(path, sr=None, mono=False)
+                    if y.ndim == 2:
+                        y = y.T   # librosa → (ch, samples); soundfile wants (samples, ch)
+                except Exception as exc:
+                    self.root.after(0, lambda e=exc: self.status_var.set(
+                        f"Cannot read audio: {e}"))
+                    return
+            # Peak-normalise to match synthesised output volume
+            peak = np.abs(y).max()
+            if peak > 1e-6:
+                y = (y / peak * 0.9).astype(np.float32)
+            tmp = self.temp_dir / "_ref_preview.wav"
+            sf.write(str(tmp), y, sr)
+            self.player.load(tmp)
+            self.player.play()
+        self._run_bg(task, success=f"Playing reference: {Path(path).name}")
 
     def vmatch_transcribe(self) -> None:
         ref = self._vmatch_ref_var.get().strip()
@@ -1429,11 +1689,102 @@ class VoiceLabApp:
                 if self._vmatch_transcript_widget:
                     self._vmatch_transcript_widget.delete("1.0", "end")
                     self._vmatch_transcript_widget.insert("1.0", text)
-                self.status_var.set("Transcription complete")
+                # Save sidecar — skip if text looks like an error placeholder
+                if text and not text.startswith("["):
+                    try:
+                        self._vmatch_transcript_path(ref).write_text(
+                            text, encoding="utf-8")
+                        self.status_var.set(
+                            f"Transcription saved → {self._vmatch_transcript_path(ref).name}")
+                    except OSError:
+                        self.status_var.set("Transcription complete (could not save sidecar)")
+                else:
+                    self.status_var.set("Transcription complete")
             self.root.after(0, update)
 
         self.status_var.set("Transcribing…")
         threading.Thread(target=task, daemon=True).start()
+
+    @staticmethod
+    def _vmatch_prepare_audio(
+        path: str,
+        target_s: float = 8.0,
+        min_s: float = 2.0,
+        _force_offset_frac: float | None = None,
+    ) -> tuple[np.ndarray, int, str]:
+        """Load audio and return a speech-dense segment of roughly target_s seconds.
+
+        Steps:
+          1. Load + trim leading/trailing silence.
+          2. If < min_s: tile up to target_s (looped short sample).
+          3. If <= target_s: use as-is.
+          4. If > target_s: score 1s windows by RMS, pick the best contiguous
+             target_s window (highest mean energy = most speech-dense region).
+
+        Returns (audio_array, sample_rate, note_string).
+        """
+        import librosa
+
+        y, sr = librosa.load(path, sr=22050, mono=True)
+        raw_dur = len(y) / sr
+
+        # Trim silence — fall back to raw if trim eats almost everything
+        yt, _ = librosa.effects.trim(y, top_db=30)
+        if len(yt) < sr * 0.5:
+            yt = y
+        trimmed_dur = len(yt) / sr
+
+        target_n = int(target_s * sr)
+        min_n    = int(min_s    * sr)
+
+        # Case 1: too short — tile
+        if len(yt) < min_n:
+            repeats = int(np.ceil(target_n / max(len(yt), 1)))
+            yt = np.tile(yt, repeats)[:target_n]
+            note = f"{raw_dur:.1f}s → tiled to {target_s:.0f}s"
+            return yt, sr, note
+
+        # Case 2: within range — use as-is
+        if len(yt) <= target_n:
+            note = f"{raw_dur:.1f}s → used as-is ({trimmed_dur:.1f}s after silence trim)"
+            return yt, sr, note
+
+        # Case 3: too long — find best window
+        hop_n = sr // 2           # 0.5s hop
+        win_n = sr                # 1s scoring window
+        rms_scores: list[float] = []
+        for start in range(0, len(yt) - win_n, hop_n):
+            chunk = yt[start:start + win_n]
+            rms_scores.append(float(np.sqrt(np.mean(chunk ** 2))))
+
+        n_hops = max(1, int(np.ceil(target_s / 0.5)))
+        best_start_hop = 0
+        best_score = -1.0
+        for i in range(max(1, len(rms_scores) - n_hops + 1)):
+            score = float(np.mean(rms_scores[i:i + n_hops]))
+            if score > best_score:
+                best_score = score
+                best_start_hop = i
+
+        # _force_offset_frac overrides best-window search (used for multi-window averaging)
+        if _force_offset_frac is not None:
+            forced_start = int(_force_offset_frac * len(yt))
+            # snap to nearest hop boundary
+            best_start_hop = forced_start // hop_n
+            best_score = float(np.mean(rms_scores[best_start_hop:best_start_hop + n_hops])) if rms_scores else 0.0
+
+        start_n = best_start_hop * hop_n
+        segment = yt[start_n:start_n + target_n]
+
+        # Edge case: segment ended up short (end of file)
+        if len(segment) < min_n:
+            repeats = int(np.ceil(target_n / max(len(segment), 1)))
+            segment = np.tile(segment, repeats)[:target_n]
+
+        offset_s = start_n / sr
+        note = (f"{raw_dur:.1f}s → best {target_s:.0f}s window "
+                f"(@ {offset_s:.1f}s, RMS={best_score:.4f})")
+        return segment, sr, note
 
     def vmatch_find_match(self) -> None:
         ref = self._vmatch_ref_var.get().strip()
@@ -1444,6 +1795,9 @@ class VoiceLabApp:
             self.status_var.set("Build fingerprints first.")
             return
 
+        self.status_var.set("Searching…")
+        self._vmatch_progress_var.set("Searching…")
+
         def task() -> None:
             try:
                 import librosa
@@ -1451,28 +1805,133 @@ class VoiceLabApp:
                 self.root.after(0, lambda: self.status_var.set(
                     "librosa not installed — pip install librosa"))
                 return
-            y, sr = librosa.load(ref, sr=22050, mono=True)
-            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-            ref_vec = np.concatenate([mfcc.mean(axis=1), mfcc.std(axis=1)])
 
-            scored: list[tuple[float, str]] = []
+            self.root.after(0, lambda: self.status_var.set("Preparing audio…"))
+            y, sr, note = self._vmatch_prepare_audio(ref)
+
+            # Multi-window averaging for long files
+            raw_dur = librosa.get_duration(path=ref)
+            all_windows = [y]
+            if raw_dur > 20.0:
+                for offset_frac in (0.33, 0.66):
+                    y2, _, _ = self._vmatch_prepare_audio(
+                        ref, target_s=8.0, min_s=2.0,
+                        _force_offset_frac=offset_frac,
+                    )
+                    all_windows.append(y2)
+                note += f"  (+{len(all_windows)-1} extra windows averaged)"
+
+            # ── Step 1: measure reference F0 for register gating ─────────────
+            self.root.after(0, lambda: self.status_var.set("Measuring reference pitch…"))
+            try:
+                f0_frames, voiced, _ = librosa.pyin(
+                    y, fmin=50, fmax=500, sr=sr, frame_length=2048, hop_length=512)
+                voiced_f0 = f0_frames[voiced] if voiced is not None else f0_frames
+                ref_f0 = float(np.median(voiced_f0[voiced_f0 > 0])) if (
+                    voiced_f0 is not None and np.any(voiced_f0 > 0)) else 0.0
+            except Exception:
+                ref_f0 = 0.0
+            f0_label = f"{ref_f0:.0f} Hz" if ref_f0 > 0 else "unknown"
+            note += f"  |  ref F0 ≈ {f0_label}"
+            self.root.after(0, lambda: self.status_var.set(f"Analysing… ({note})"))
+
+            # ── Step 2: MFCC screen with F0 gating ───────────────────────────
+            # Weight lower MFCC coefficients more — they carry timbre/formant info;
+            # higher ones are more content-dependent.
+            mfcc_weights = np.array(
+                [2.0, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2,
+                 1.5, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1],
+                dtype=np.float32,
+            )  # 26 = 13 mean + 13 std
+
+            vecs = []
+            for w in all_windows:
+                m = librosa.feature.mfcc(y=w, sr=sr, n_mfcc=13)
+                vecs.append(np.concatenate([m.mean(axis=1), m.std(axis=1)]))
+            ref_vec = np.mean(vecs, axis=0) * mfcc_weights
+
+            def f0_ok(voice_f0_str: str) -> bool:
+                """Allow voices whose F0 is within 40% of reference F0."""
+                if ref_f0 <= 0:
+                    return True  # no reference F0 — no gating
+                try:
+                    vf0 = float(voice_f0_str)
+                except (ValueError, TypeError):
+                    return True  # no voice F0 data — let it through
+                if vf0 <= 0:
+                    return True
+                ratio = abs(ref_f0 - vf0) / ref_f0
+                return ratio < 0.40
+
+            passed, gated_out = 0, 0
+            coarse: list[tuple[float, str]] = []
             for name, fp in self._vmatch_mfcc_db.items():
                 if "mean" not in fp:
                     continue
-                fp_vec = np.concatenate([np.array(fp["mean"]), np.array(fp["std"])])
+                # F0 gate using acoustic CSV data loaded into self._acoustic
+                acoustic_row = self._acoustic.get(name, {})
+                if not f0_ok(acoustic_row.get("f0_hz", "")):
+                    gated_out += 1
+                    continue
+                fp_vec = np.concatenate([np.array(fp["mean"]), np.array(fp["std"])]) * mfcc_weights
                 dist = float(np.linalg.norm(ref_vec - fp_vec))
-                scored.append((dist, name))
-            scored.sort()
-            self._vmatch_scores = scored
+                coarse.append((dist, name))
+                passed += 1
+            coarse.sort()
+
+            gate_note = (f"F0 gate: {passed} voices in range"
+                         f"{f', {gated_out} excluded' if gated_out else ''}")
+            self.root.after(0, lambda: self.status_var.set(gate_note))
+
+            # ── Step 3: content-matched re-rank on top 12 ────────────────────
+            # Synthesise each top candidate saying the transcript (or coverage
+            # sentence), compare against the reference MFCC with same content.
+            # This eliminates the content-mismatch contamination in the coarse step.
+            reranked = list(coarse)
+            transcript = self._vmatch_match_text()
+            if self._can_synthesize() and coarse:
+                top_for_rerank = coarse[:12]
+                self.root.after(0, lambda: self.status_var.set(
+                    f"Re-ranking top {len(top_for_rerank)} via synthesis…"))
+                rescore: list[tuple[float, str]] = []
+                for i, (_, name) in enumerate(top_for_rerank):
+                    self.root.after(0, lambda n=name, idx=i, tot=len(top_for_rerank):
+                        self.status_var.set(f"Re-rank {idx+1}/{tot}: {n}"))
+                    try:
+                        vobj = self.voice_lib.get(name)
+                        wav_tmp = self.temp_dir / f"_rerank_{i}.wav"
+                        self._do_synthesize(vobj.path, transcript, wav_tmp)
+                        ys, _ = librosa.load(str(wav_tmp), sr=sr, mono=True)
+                        ms = librosa.feature.mfcc(y=ys, sr=sr, n_mfcc=13)
+                        sv = np.concatenate([ms.mean(axis=1), ms.std(axis=1)]) * mfcc_weights
+                        rescore.append((float(np.linalg.norm(ref_vec - sv)), name))
+                    except Exception:
+                        rescore.append((coarse[i][0], name))  # keep coarse score on fail
+                    finally:
+                        try:
+                            (self.temp_dir / f"_rerank_{i}.wav").unlink()
+                        except OSError:
+                            pass
+                rescore.sort()
+                # Merge: re-ranked top-12 first, then remainder of coarse list
+                reranked_names = {n for _, n in rescore}
+                reranked = rescore + [(d, n) for d, n in coarse[12:] if n not in reranked_names]
+            else:
+                reranked = coarse
+
+            self._vmatch_scores = reranked
 
             def update() -> None:
                 if self._vmatch_results_listbox:
                     self._vmatch_results_listbox.delete(0, "end")
-                    for rank, (dist, name) in enumerate(scored[:10], 1):
+                    self._vmatch_results_listbox.insert("end", f"  [ {note} ]")
+                    self._vmatch_results_listbox.insert("end", f"  [ {gate_note} ]")
+                    for rank, (dist, name) in enumerate(reranked[:10], 1):
                         self._vmatch_results_listbox.insert(
                             "end", f"  {rank:2}.  {name:<22}  dist = {dist:.3f}")
                 self.status_var.set(
-                    f"Best match: {scored[0][1]}" if scored else "No results")
+                    f"Best match: {reranked[0][1]}  (ref F0 ≈ {f0_label})"
+                    if reranked else "No results")
             self.root.after(0, update)
 
         self._run_bg(task, success="Match complete")
@@ -1502,6 +1961,298 @@ class VoiceLabApp:
         out = self._default_export_path()
         self._capture_export_fx()
         self._run_bg(lambda: self._write_export(out), success=f"Exported → {out.name}")
+
+    def vmatch_preview_result(self) -> None:
+        """Synthesise and play the current top-3 blend using the match text."""
+        if not self._vmatch_scores:
+            self.status_var.set("Run Find Match first.")
+            return
+        if not self._require_voices() or not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server first.")
+            return
+        self.vmatch_load_to_mixer()
+        text = self._vmatch_match_text()
+        def task() -> None:
+            _, mix_bin = self._build_mix_bin()
+            self._synth_and_play_text(mix_bin, text, "vmatch_preview")
+        self._run_bg(task, success="Playing match result")
+
+    def _vmatch_match_text(self) -> str:
+        """Return transcript text if present, otherwise the test sentence."""
+        if self._vmatch_transcript_widget:
+            t = self._vmatch_transcript_widget.get("1.0", "end").strip()
+            if t and not t.startswith("["):
+                return t
+        return self.test_sentence_var.get() or DEFAULT_TEST_SENTENCE
+
+    def _synth_and_play_text(self, voice_path: Path, text: str, wav_name: str) -> None:
+        """Like _synth_and_play but with explicit text instead of the test sentence."""
+        base = self.temp_dir / f"{wav_name}_base.wav"
+        self._do_synthesize(voice_path, text, base, speed=1.0)
+        self.player.load(base)
+        self.player.play()
+
+    # ── Fine Tune panel ───────────────────────────────────────────────────────
+
+    def _vmatch_tune_from_cand(self, cand: list[tuple[str, float, float]]) -> None:
+        """Populate Fine Tune slots from a recipe. Must be called on main thread."""
+        active = [(n, w, p) for n, w, p in cand if w > 0.02]
+        total_w = sum(w for _, w, _ in active) or 1.0
+        voice_names = [v.name for v in self.voice_lib.voices]
+        for i in range(3):
+            if i < len(active):
+                name, w, pitch = active[i]
+                self._vmatch_tune_voice_vars[i].set(name)
+                self._vmatch_tune_weight_vars[i].set(round(w / total_w * 100))
+                self._vmatch_tune_pitch_vars[i].set(pitch)
+                if self._vmatch_tune_combos:
+                    self._vmatch_tune_combos[i]["values"] = voice_names
+            else:
+                self._vmatch_tune_voice_vars[i].set("")
+                self._vmatch_tune_weight_vars[i].set(0)
+                self._vmatch_tune_pitch_vars[i].set(0.0)
+
+    def _vmatch_tune_recipe(self) -> list[tuple[str, float, float]]:
+        """Read current Fine Tune state → [(name, norm_weight, pitch_st), ...]."""
+        raw = []
+        for i in range(3):
+            name = self._vmatch_tune_voice_vars[i].get().strip()
+            w = float(self._vmatch_tune_weight_vars[i].get())
+            p = float(self._vmatch_tune_pitch_vars[i].get())
+            if name and w > 0:
+                raw.append((name, w, p))
+        if not raw:
+            return []
+        total = sum(w for _, w, _ in raw)
+        return [(n, w / total, p) for n, w, p in raw]
+
+    def _vmatch_synth_recipe(
+        self,
+        components: list[tuple[str, float, float]],
+        wav_name: str,
+        speed: float = 1.0,
+    ) -> None:
+        """Build mixed embedding → temp bin → synthesise transcript text → play. BG thread."""
+        emb = self._vmatch_build_embedding(components)
+        if emb is None:
+            return
+        tmp = self.temp_dir / f"{wav_name}.bin"
+        VoiceLibrary.save_bin(emb, tmp)
+        try:
+            wav_out = self.temp_dir / f"{wav_name}_base.wav"
+            self._do_synthesize(tmp, self._vmatch_match_text(), wav_out, speed=speed)
+            self.player.load(wav_out)
+            self.player.play()
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def vmatch_tune_preview(self) -> None:
+        recipe = self._vmatch_tune_recipe()
+        if not recipe:
+            self.status_var.set("Set at least one slot in Fine Tune.")
+            return
+        if not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server first.")
+            return
+        spd = self._vmatch_opt_speed
+        self._run_bg(lambda: self._vmatch_synth_recipe(recipe, "vmatch_tune", speed=spd),
+                     success="Playing Fine Tune blend")
+
+    def vmatch_tune_preview_slot(self, idx: int) -> None:
+        name = self._vmatch_tune_voice_vars[idx].get().strip()
+        if not name:
+            self.status_var.set(f"Slot {idx+1} has no voice selected.")
+            return
+        if not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server first.")
+            return
+        pitch = float(self._vmatch_tune_pitch_vars[idx].get())
+        recipe: list[tuple[str, float, float]] = [(name, 1.0, pitch)]
+        spd = self._vmatch_opt_speed
+        self._run_bg(lambda: self._vmatch_synth_recipe(recipe, f"vmatch_tune_slot{idx}", speed=spd),
+                     success=f"Playing slot {idx+1}: {name}")
+
+    def vmatch_tune_export(self) -> None:
+        recipe = self._vmatch_tune_recipe()
+        if not recipe:
+            self.status_var.set("Set at least one slot in Fine Tune.")
+            return
+        out = self._default_export_path()
+        def task() -> None:
+            emb = self._vmatch_build_embedding(recipe)
+            if emb is None:
+                return
+            VoiceLibrary.save_bin(emb, out)
+            if self.save_sidecar_var.get():
+                out.with_suffix(".json").write_text(json.dumps({
+                    "source": "vmatch_fine_tune",
+                    "components": [{"voice": n, "weight": round(w, 4), "pitch_st": p}
+                                   for n, w, p in recipe],
+                    "matched_speed": round(self._vmatch_opt_speed, 3),
+                }, indent=2))
+            self.last_export_path = out
+            self.root.after(0, self._refresh_voice_dropdowns)
+        self._run_bg(task, success=f"Exported Fine Tune → {out.name}")
+
+    def vmatch_tune_load_to_mixer(self) -> None:
+        recipe = self._vmatch_tune_recipe()
+        if not recipe:
+            self.status_var.set("Set at least one slot in Fine Tune.")
+            return
+        voice_names = [v.name for v in self.voice_lib.voices]
+        for i in range(3):
+            if i < len(recipe):
+                name, w, pitch = recipe[i]
+                if name in voice_names:
+                    self.voice_vars[i].set(name)
+                self.weight_vars[i].set(round(w * 100))
+                self.pitch_vars[i].set(pitch)
+                self.active_vars[i].set(True)
+            else:
+                self.active_vars[i].set(False)
+                self.weight_vars[i].set(0)
+                self.pitch_vars[i].set(0.0)
+        if self.pitch_axis.available:
+            self.bake_pitch_var.set(True)
+        self.status_var.set("Fine Tune blend → Mixer (pitch bake on)")
+        self._recompute_summary()
+
+    # ── Blend Explorer ────────────────────────────────────────────────────────
+
+    def _vmatch_generate_variants(
+        self, baseline: list[tuple[str, float, float]]
+    ) -> list[list[tuple[str, float, float]]]:
+        """Inject 3 pool voices into the current blend at INJ%, one per variant.
+
+        The current blend is treated as a single unit.  Each variant is:
+            current_blend * (1 - INJ)  +  new_pool_voice * INJ
+        which — because embedding mixing is linear — is identical to the flat
+        recipe with all baseline weights scaled by (1 - INJ) and the new voice
+        appended.  No temp file needed.
+        """
+        active = [(n, w, p) for n, w, p in baseline if w > 0.01]
+        if not active:
+            return []
+        total = sum(w for _, w, _ in active)
+        base_norm = [(n, w / total, p) for n, w, p in active]
+        base_names = {n for n, _, _ in base_norm}
+
+        # Candidate pool: MFCC-ranked voices not already in the blend
+        pool = [nm for _, nm in self._vmatch_scores[:14] if nm not in base_names]
+        if not pool:
+            return []
+
+        INJ = 0.18  # fraction given to the injected voice each round
+        variants: list[list[tuple[str, float, float]]] = []
+        for pool_voice in pool[:3]:
+            scaled = [(n, w * (1.0 - INJ), p) for n, w, p in base_norm]
+            variants.append(scaled + [(pool_voice, INJ, 0.0)])
+
+        return variants
+
+    def vmatch_explore_start(self) -> None:
+        recipe = self._vmatch_tune_recipe()
+        if not recipe:
+            self.status_var.set("Populate Fine Tune slots first (or run Optimise Blend).")
+            return
+        if not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server first.")
+            return
+        self._vmatch_explore_baseline = recipe
+        self._vmatch_explore_round = 1
+        self._vmatch_explore_variants = self._vmatch_generate_variants(recipe)
+        self._vmatch_explore_render()
+
+    def _vmatch_explore_render(self) -> None:
+        variants = self._vmatch_explore_variants
+        n = len(variants)
+        label_chars = "ABC"
+        base_names = {nm for nm, _, _ in self._vmatch_explore_baseline}
+
+        def _desc(v: list[tuple[str, float, float]]) -> str:
+            # Show only the injected voice — the rest is "base"
+            new = [(nm, w) for nm, w, _ in v if nm not in base_names and w > 0.01]
+            if new:
+                return "base + " + " + ".join(
+                    f"+{nm} ({w * 100:.0f}%)" for nm, w in sorted(new, key=lambda x: x[1], reverse=True))
+            sv = sorted(v, key=lambda x: x[1], reverse=True)
+            return " + ".join(f"{nm}({w*100:.0f}%)" for nm, w, _ in sv if w > 0.01)
+
+        self._vmatch_explore_round_var.set(
+            f"Round {self._vmatch_explore_round} — testing 3 voices injected into current blend (18%):")
+
+        play_vars = [self._vmatch_explore_a_var, self._vmatch_explore_b_var, self._vmatch_explore_c_var]
+        for i in range(3):
+            play_btn = self._vmatch_explore_btns[i]
+            pick_btn = self._vmatch_explore_btns[3 + i]
+            if i < n:
+                play_vars[i].set(f"▶  {label_chars[i]}: {_desc(variants[i])}")
+                play_btn.config(state="normal")
+                pick_btn.config(state="normal")
+            else:
+                play_vars[i].set(f"▶  {label_chars[i]}: —")
+                play_btn.config(state="disabled")
+                pick_btn.config(state="disabled")
+
+    def vmatch_explore_play(self, idx: int) -> None:
+        if idx >= len(self._vmatch_explore_variants):
+            return
+        if not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server first.")
+            return
+        variant = self._vmatch_explore_variants[idx]
+        label = "ABC"[idx]
+        spd = self._vmatch_opt_speed
+        self._run_bg(lambda: self._vmatch_synth_recipe(variant, f"vmatch_explore_{label}", speed=spd),
+                     success=f"Playing Explorer variant {label}")
+
+    def vmatch_explore_pick(self, idx: int) -> None:
+        if idx >= len(self._vmatch_explore_variants):
+            return
+        winner = self._vmatch_explore_variants[idx]
+        old_names = {n for n, _, _ in self._vmatch_explore_baseline}
+        injected = [n for n, _, _ in winner if n not in old_names]
+
+        # Truncate to top 3 by weight so Fine Tune can display it and next
+        # round stays clean.  The dropped voice contributes <5% — negligible.
+        sorted_w = sorted(winner, key=lambda x: x[1], reverse=True)[:3]
+        total = sum(w for _, w, _ in sorted_w)
+        truncated = [(n, w / total, p) for n, w, p in sorted_w]
+
+        self.root.after(0, lambda: self._vmatch_tune_from_cand(truncated))
+        self._vmatch_explore_baseline = truncated
+        self._vmatch_explore_round += 1
+        self._vmatch_explore_variants = self._vmatch_generate_variants(truncated)
+        self._vmatch_explore_render()
+
+        label = chr(65 + idx)
+        added = f" (+{injected[0]})" if injected else ""
+        self.status_var.set(f"Picked {label}{added} — Fine Tune updated, next round ready")
+
+    def vmatch_explore_export(self) -> None:
+        recipe = self._vmatch_explore_baseline
+        if not recipe:
+            self.status_var.set("Run Start Explorer and pick at least one round first.")
+            return
+        out = self._default_export_path()
+        def task() -> None:
+            emb = self._vmatch_build_embedding(recipe)
+            if emb is None:
+                return
+            VoiceLibrary.save_bin(emb, out)
+            if self.save_sidecar_var.get():
+                out.with_suffix(".json").write_text(json.dumps({
+                    "source": "vmatch_blend_explorer",
+                    "components": [{"voice": n, "weight": round(w, 4), "pitch_st": p}
+                                   for n, w, p in recipe],
+                    "matched_speed": round(self._vmatch_opt_speed, 3),
+                }, indent=2))
+            self.last_export_path = out
+            self.root.after(0, self._refresh_voice_dropdowns)
+        self._run_bg(task, success=f"Exported Explorer blend → {out.name}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Mixer logic
@@ -1753,7 +2504,7 @@ class VoiceLabApp:
             traits = self.ratings.get_traits(name)
             if not traits:
                 continue
-            dist = sum(abs(int(traits.get(k, 3)) - tv) for k, tv in target.items())
+            dist = sum(abs(int(traits.get(k, 5)) - tv) for k, tv in target.items())
             scored.append((dist, name))
         scored.sort()
         winners = [n for _, n in scored[:3]]
@@ -1962,7 +2713,13 @@ class VoiceLabApp:
     def open_export_folder(self) -> None:
         d = Path(self.export_dir_var.get().strip() or DEFAULT_EXPORT_DIR)
         d.mkdir(parents=True, exist_ok=True)
-        subprocess.Popen(["explorer", str(d)])
+        import sys as _sys
+        if _sys.platform == "win32":
+            os.startfile(str(d))
+        elif _sys.platform == "darwin":
+            subprocess.Popen(["open", str(d)])
+        else:
+            subprocess.Popen(["xdg-open", str(d)])
 
     def stop_audio(self) -> None:
         self.player.stop()
@@ -2027,6 +2784,365 @@ class VoiceLabApp:
         self._recompute_summary()
         if self.autosave_var.get():
             self._safe_save_quiet()
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Voice Match — hill-climbing optimiser
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _vmatch_build_embedding(self, components: list[tuple[str, float, float]]) -> np.ndarray | None:
+        """Build a mixed+pitch-shifted embedding from [(name, weight, pitch_st), ...]."""
+        active = [(n, w, p) for n, w, p in components if w > 0.02]
+        if not active:
+            return None
+        ws = np.array([w for _, w, _ in active], dtype=np.float32)
+        ws /= ws.sum()
+        result: np.ndarray | None = None
+        for (name, _, pitch_st), weight in zip(active, ws):
+            try:
+                v = self.voice_lib.get(name)
+            except KeyError:
+                continue
+            arr = self.voice_lib.load_array(v).copy()
+            if self.pitch_axis.available and abs(pitch_st) > 0.1:
+                arr = self.pitch_axis.shift(arr, pitch_st)
+            if result is None:
+                result = arr * weight
+            else:
+                # Voice bins can have different row counts; zero-pad to the longer
+                n = max(len(result), len(arr))
+                if len(result) < n:
+                    result = np.pad(result, ((0, n - len(result)), (0, 0), (0, 0)))
+                if len(arr) < n:
+                    arr = np.pad(arr, ((0, n - len(arr)), (0, 0), (0, 0)))
+                result = result + arr * weight
+        return result
+
+    @staticmethod
+    def _vmatch_fmt(components: list[tuple[str, float, float]]) -> str:
+        active = [(n, w, p) for n, w, p in components if w > 0.02]
+        ws = np.array([w for _, w, _ in active], dtype=np.float32)
+        ws /= ws.sum()
+        parts = []
+        for (name, _, pitch_st), w in zip(active, ws):
+            s = f"{name}({w:.0%})"
+            if abs(pitch_st) > 0.1:
+                s += f"@{pitch_st:+.1f}st"
+            parts.append(s)
+        return " + ".join(parts)
+
+    def _vmatch_optimise_worker(self, ref_path: str) -> None:
+        try:
+            import librosa
+        except ImportError:
+            self.root.after(0, lambda: self.status_var.set(
+                "Optimise: librosa not installed"))
+            return
+
+        rng = np.random.default_rng()
+
+        def prog(msg: str) -> None:
+            self.root.after(0, lambda m=msg: self.status_var.set(m))
+            self.root.after(0, lambda m=msg: self._vmatch_progress_var.set(m))
+
+        # Reference fingerprint — weighted to match vmatch_find_match scoring
+        # (lower MFCC coefficients 2×, higher ones 0.2–0.5×; same for std half)
+        _mfcc_w = np.array(
+            [2.0, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2,
+             1.5, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1],
+            dtype=np.float32,
+        )
+        prog("Optimise: preparing reference audio…")
+        try:
+            y_ref, sr_ref, _ = self._vmatch_prepare_audio(ref_path)
+            m_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13)
+            ref_vec = np.concatenate([m_ref.mean(axis=1), m_ref.std(axis=1)]) * _mfcc_w
+        except Exception as exc:
+            prog(f"Optimise: reference error — {exc}")
+            return
+
+        synth_text = self._vmatch_match_text()
+        call_idx = [0]
+
+        # ── Speed calibration ─────────────────────────────────────────────────
+        # Measure how long the reference speaker actually takes to say the
+        # transcript, then find the Kokoro speed multiplier that matches it.
+        # This prevents the optimiser from matching a voice that happens to
+        # run fast against a slow reference (or vice versa).
+        opt_speed = 1.0
+        try:
+            prog("Optimise: calibrating speed to reference pacing…")
+            y_full, sr_full = librosa.load(ref_path, sr=22050, mono=True)
+            y_trim, _ = librosa.effects.trim(y_full, top_db=30)
+            if len(y_trim) < sr_full * 0.5:
+                y_trim = y_full
+            ref_speech_dur = len(y_trim) / sr_full
+
+            # Synthesize the transcript with the top-ranked voice at 1× to
+            # establish Kokoro's natural duration for this text.
+            voice_pool_pre = [name for _, name in self._vmatch_scores[:8]]
+            if voice_pool_pre:
+                cal_bin = self.temp_dir / "_cal_speed.bin"
+                cal_wav = self.temp_dir / "_cal_speed.wav"
+                try:
+                    v_cal = self.voice_lib.get(voice_pool_pre[0])
+                    VoiceLibrary.save_bin(self.voice_lib.load_array(v_cal), cal_bin)
+                    self._do_synthesize(cal_bin, synth_text, cal_wav, speed=1.0)
+                    y_cal, sr_cal = librosa.load(str(cal_wav), sr=22050, mono=True)
+                    synth_dur = len(y_cal) / sr_cal
+                    raw_speed = synth_dur / max(ref_speech_dur, 0.5)
+                    opt_speed = float(np.clip(raw_speed, 0.5, 2.0))
+                    prog(f"Optimise: ref={ref_speech_dur:.1f}s  synth={synth_dur:.1f}s "
+                         f"→ speed×{opt_speed:.2f}")
+                finally:
+                    for _p in (cal_bin, cal_wav):
+                        try:
+                            _p.unlink()
+                        except OSError:
+                            pass
+        except Exception as _cal_exc:
+            opt_speed = 1.0
+            prog(f"Optimise: speed calibration skipped ({_cal_exc})")
+
+        def score_emb(arr: np.ndarray) -> float:
+            if arr is None:
+                return 999.0
+            tag = f"opt{call_idx[0]}"
+            call_idx[0] += 1
+            bin_tmp = self.temp_dir / f"_{tag}.bin"
+            wav_tmp = self.temp_dir / f"_{tag}.wav"
+            VoiceLibrary.save_bin(arr, bin_tmp)
+            try:
+                # _do_synthesize is safe to call concurrently — PersistentSynthServer
+                # serializes requests internally via its own threading.Lock.
+                self._do_synthesize(bin_tmp, synth_text, wav_tmp, speed=opt_speed)
+                y, _ = librosa.load(str(wav_tmp), sr=sr_ref, mono=True)
+                m = librosa.feature.mfcc(y=y, sr=sr_ref, n_mfcc=13)
+                cand_vec = np.concatenate([m.mean(axis=1), m.std(axis=1)]) * _mfcc_w
+                return float(np.linalg.norm(ref_vec - cand_vec))
+            except Exception:
+                return 999.0
+            finally:
+                for p in (bin_tmp, wav_tmp):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+
+        # Voice pool — top voices from MFCC screen
+        voice_pool = [name for _, name in self._vmatch_scores[:8]]
+        top = voice_pool[:5]
+        if not top:
+            prog("Optimise: run Find Match first")
+            return
+
+        # Initial candidate set
+        inits: list[list[tuple[str, float, float]]] = [
+            [(top[0], 1.0, 0.0)],
+        ]
+        if len(top) >= 2:
+            inits += [
+                [(top[0], 0.70, 0.0), (top[1], 0.30, 0.0)],
+                [(top[0], 0.50, 0.0), (top[1], 0.50, 0.0)],
+            ]
+        if len(top) >= 3:
+            inits += [
+                [(top[0], 0.60, 0.0), (top[1], 0.25, 0.0), (top[2], 0.15, 0.0)],
+                [(top[0], 0.34, 0.0), (top[1], 0.33, 0.0), (top[2], 0.33, 0.0)],
+            ]
+
+        prog(f"Optimise: scoring {len(inits)} starting candidates…")
+        best_dist = 999.0
+        best_cand: list[tuple[str, float, float]] = inits[0]
+        for i, cand in enumerate(inits):
+            prog(f"Optimise: initial {i+1}/{len(inits)}: {self._vmatch_fmt(cand)}")
+            emb = self._vmatch_build_embedding(cand)
+            d = score_emb(emb)
+            if d < best_dist:
+                best_dist, best_cand = d, cand
+
+        prog(f"Optimise: baseline {self._vmatch_fmt(best_cand)}  dist={best_dist:.3f}")
+
+        def mutate(cand: list[tuple[str, float, float]]) -> list[tuple[str, float, float]]:
+            c = [list(x) for x in cand]
+            choice = rng.choice(["weight", "weight", "pitch", "pitch", "swap"])
+
+            if choice == "weight" and len(c) > 0:
+                idx = int(rng.integers(len(c)))
+                w_scale = max(x[1] for x in c)
+                delta = float(rng.uniform(-0.15, 0.15)) * w_scale
+                c[idx][1] = max(0.05, c[idx][1] + delta)
+                if len(c) > 1:
+                    c = [x for x in c if x[1] > 0.03]
+
+            elif choice == "pitch" and self.pitch_axis.available:
+                idx = int(rng.integers(len(c)))
+                delta = float(rng.uniform(-1.0, 1.0))
+                c[idx][2] = float(np.clip(c[idx][2] + delta, -5.0, 5.0))
+
+            elif choice == "swap":
+                existing = {x[0] for x in c}
+                alternatives = [n for n in voice_pool if n not in existing]
+                if alternatives and len(c) < 3:
+                    new_name = alternatives[int(rng.integers(len(alternatives)))]
+                    c.append([new_name, 0.15, 0.0])
+                elif alternatives and len(c) >= 2:
+                    lightest = min(range(len(c)), key=lambda i: c[i][1])
+                    new_name = alternatives[int(rng.integers(len(alternatives)))]
+                    c[lightest] = [new_name, c[lightest][1], 0.0]
+
+            return [tuple(x) for x in c] if c else cand  # type: ignore[return-value]
+
+        # Hill climbing
+        no_improve = 0
+        MAX_ITER, N_MUT = 10, 6
+        for iteration in range(MAX_ITER):
+            improved = False
+            for mi in range(N_MUT):
+                m_cand = mutate(best_cand)
+                prog(f"Optimise iter {iteration+1}/{MAX_ITER}  mut {mi+1}/{N_MUT}: "
+                     f"{self._vmatch_fmt(m_cand)}")
+                emb = self._vmatch_build_embedding(m_cand)
+                d = score_emb(emb)
+                if d < best_dist:
+                    best_dist, best_cand = d, m_cand
+                    improved = True
+            if not improved:
+                no_improve += 1
+                if no_improve >= 2:
+                    break
+            else:
+                no_improve = 0
+
+        # ── Fine local refinement pass ─────────────────────────────────────────
+        # Hill-climbing stops when ±15% mutations stop helping. Do a deterministic
+        # tight grid (±5% on each weight, ±0.5st on each pitch) to squeeze the last
+        # bit without randomness. Cost: 2 × n_slots passes of synthesis calls.
+        prog("Optimise: fine-tuning around best candidate…")
+        FINE_DELTA_W, FINE_DELTA_P = 0.05, 0.5
+        MAX_FINE_ITERS = 5
+        fine_improved = True
+        fine_iter = 0
+        while fine_improved and fine_iter < MAX_FINE_ITERS:
+            fine_iter += 1
+            fine_improved = False
+            c = [list(x) for x in best_cand]
+            for i in range(len(c)):
+                for dw in (-FINE_DELTA_W, +FINE_DELTA_W):
+                    trial = [list(x) for x in best_cand]
+                    trial[i][1] = max(0.03, trial[i][1] + dw)
+                    trial_tup = [tuple(x) for x in trial]  # type: ignore[misc]
+                    prog(f"Optimise: fine weight slot {i+1} {dw:+.0%} → "
+                         f"{self._vmatch_fmt(trial_tup)}")
+                    d = score_emb(self._vmatch_build_embedding(trial_tup))
+                    if d < best_dist:
+                        best_dist, best_cand = d, trial_tup
+                        fine_improved = True
+                if self.pitch_axis.available:
+                    for dp in (-FINE_DELTA_P, +FINE_DELTA_P):
+                        trial = [list(x) for x in best_cand]
+                        trial[i][2] = float(np.clip(trial[i][2] + dp, -5.0, 5.0))
+                        trial_tup = [tuple(x) for x in trial]  # type: ignore[misc]
+                        prog(f"Optimise: fine pitch slot {i+1} {dp:+.1f}st → "
+                             f"{self._vmatch_fmt(trial_tup)}")
+                        d = score_emb(self._vmatch_build_embedding(trial_tup))
+                        if d < best_dist:
+                            best_dist, best_cand = d, trial_tup
+                            fine_improved = True
+
+        # Store result
+        self._vmatch_opt_emb   = self._vmatch_build_embedding(best_cand)
+        self._vmatch_opt_cand  = best_cand
+        self._vmatch_opt_desc  = self._vmatch_fmt(best_cand)
+        self._vmatch_opt_dist  = best_dist
+        self._vmatch_opt_speed = opt_speed
+
+        # Quality label for the final dist score
+        if best_dist < 3.0:
+            quality = "excellent"
+        elif best_dist < 5.0:
+            quality = "good"
+        elif best_dist < 8.0:
+            quality = "fair"
+        else:
+            quality = "rough"
+
+        def finish() -> None:
+            summary = f"★ {self._vmatch_opt_desc}  dist={best_dist:.2f} ({quality})"
+            self._vmatch_progress_var.set(summary)
+            self.status_var.set(f"Optimised: {summary}")
+            if self._vmatch_results_listbox:
+                self._vmatch_results_listbox.delete(0, "end")
+                self._vmatch_results_listbox.insert("end", f"  {summary}")
+                for rank, (d, name) in enumerate(self._vmatch_scores[:8], 1):
+                    self._vmatch_results_listbox.insert(
+                        "end", f"  {rank:2}.  {name:<22}  dist={d:.2f}")
+            # Populate Fine Tune panel from optimiser result
+            self._vmatch_tune_from_cand(self._vmatch_opt_cand)
+            spd_label = (f"Speed: {opt_speed:.2f}×  (use this in Mixer Output Speed to match "
+                         f"reference pacing — baked into previews, not the .bin)")
+            self._vmatch_speed_var.set(spd_label)
+        self.root.after(0, finish)
+
+    def vmatch_optimise(self) -> None:
+        ref = self._vmatch_ref_var.get().strip()
+        if not ref:
+            self.status_var.set("Select a reference audio file first.")
+            return
+        if not self._vmatch_scores:
+            self.status_var.set("Run Find Match first to seed the optimiser.")
+            return
+        if not self._require_voices() or not self._can_synthesize():
+            messagebox.showerror(APP_TITLE, "Start the server first.")
+            return
+        self._vmatch_progress_var.set("Optimising…")
+        threading.Thread(
+            target=self._vmatch_optimise_worker,
+            args=(ref,),
+            daemon=True,
+        ).start()
+
+    def vmatch_load_opt_to_mixer(self) -> None:
+        if not self._vmatch_opt_cand:
+            self.status_var.set("Run Optimise Blend first.")
+            return
+        active = [(n, w, p) for n, w, p in self._vmatch_opt_cand if w > 0.02]
+        ws = np.array([w for _, w, _ in active], dtype=np.float32)
+        ws = ws / ws.sum() * 100.0
+        for i in range(3):
+            if i < len(active):
+                name, _, pitch_st = active[i]
+                self.active_vars[i].set(True)
+                self.voice_vars[i].set(name)
+                self.weight_vars[i].set(round(float(ws[i]), 1))
+                self.pitch_vars[i].set(round(pitch_st, 2))
+            else:
+                self.active_vars[i].set(False)
+                self.weight_vars[i].set(0.0)
+                self.pitch_vars[i].set(0.0)
+        if self.pitch_axis.available:
+            self.bake_pitch_var.set(True)
+        self.status_var.set(
+            f"Optimised blend → Mixer: {self._vmatch_opt_desc}  (pitch bake on)")
+        self._recompute_summary()
+
+    def vmatch_export_optimised(self) -> None:
+        if self._vmatch_opt_emb is None:
+            self.status_var.set("Run Optimise Blend first.")
+            return
+        out = self._default_export_path()
+        arr = self._vmatch_opt_emb
+        def task() -> None:
+            VoiceLibrary.save_bin(arr, out)
+            if self.save_sidecar_var.get():
+                out.with_suffix(".json").write_text(
+                    json.dumps({
+                        "source": "voice_match_optimiser",
+                        "description": self._vmatch_opt_desc,
+                        "dist": self._vmatch_opt_dist,
+                        "components": self._vmatch_opt_cand,
+                    }, indent=2))
+            self.root.after(0, self._refresh_voice_dropdowns)
+        self._run_bg(task, success=f"Exported optimised → {out.name}")
 
     def _on_close(self) -> None:
         self._precache_stop.set()

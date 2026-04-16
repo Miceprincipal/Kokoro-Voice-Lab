@@ -1,6 +1,6 @@
 # Kokoro Voice Lab
 
-A GUI tool for rating, blending, and previewing voices from the [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) TTS model.
+A GUI tool for rating, blending, and approximating voices from the [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) TTS model.
 
 ![logo](logo.png)
 
@@ -8,7 +8,7 @@ A GUI tool for rating, blending, and previewing voices from the [Kokoro-82M](htt
 
 ## What it does
 
-**Ratings tab** — Work through all 54 Kokoro voices and rate each one on 8 perceptual axes: age, authority, clarity, energy, gender presentation, pitch, roughness, and warmth. Navigate with arrow keys. Ratings auto-save as you go.
+**Ratings tab** — Work through all 54 Kokoro voices and rate each one on 8 perceptual axes: age, authority, clarity, energy, gender presentation, pitch, roughness, and warmth. Navigate with arrow keys. Ratings auto-save as you go. Scale is 1–10.
 
 **Mixer tab** — Blend up to 3 voices by weight. Per-slot pitch and speed sliders let you audition each voice individually. Separate Output Speed (0.25–2.0×) and Output Pitch (±12 semitones) controls apply to the final blended preview and export. Export the result as a `.bin` file that Kokoro can use directly as a custom voice.
 
@@ -24,7 +24,14 @@ A GUI tool for rating, blending, and previewing voices from the [Kokoro-82M](htt
 
 **Voice list auto-refresh** — After exporting a `.bin`, the voice dropdowns automatically rescan the voices folder. Newly exported voices are immediately available in all slots without restarting.
 
-**Voice Match tab** — Drop in any WAV or MP3 of a real voice. The tool computes MFCC distance between the reference audio and pre-built fingerprints for every Kokoro voice, then ranks all voices by similarity. Load the top 3 into the Mixer (with inverse-distance weights pre-set) or export a blended approximation directly. Optional Whisper transcription shows what was spoken but is not used for matching — the comparison is purely acoustic. Requires `librosa`; transcription requires `faster-whisper` or `openai-whisper`.
+**Voice Match tab** — Drop in any WAV or MP3 of a real voice and approximate it from the Kokoro voice pool. Full pipeline:
+
+1. **Find Match** — measures reference F0, gates the pool to same-pitch voices, ranks all by weighted MFCC distance, then synthesises the top 12 saying your transcript and re-ranks by audio comparison. Eliminates content-mismatch contamination.
+2. **Optimise Blend** — seeds 5 starting candidates (singles and blends of the top pool voices), hill-climbs weights and pitch against the actual synthesised audio using MFCC distance as the fitness score, then runs a tight local refinement pass (±5% weights, ±0.5st pitch) to squeeze to the nearest minimum. Result score is labelled excellent / good / fair / rough.
+3. **Fine Tune** — the optimiser result auto-loads here. Three slots with voice dropdown, weight slider (showing normalised contribution %), and pitch slider (±5st). Per-slot preview and full blend preview. Export directly or send to the Mixer.
+4. **Blend Explorer** — each round injects 3 pool voices (18% each) into your current blend and offers them as A / B / C choices. Play each (synthesised saying your transcript), pick the closest — Fine Tune updates and the next round tests 3 more voices. Converges by ear on the missing ingredient the automatic optimiser didn't find.
+
+Requires `librosa` for fingerprints and matching. Transcription requires `faster-whisper` or `openai-whisper`.
 
 ---
 
@@ -71,7 +78,7 @@ pip install onnxruntime-gpu misaki[en] soundfile numpy pillow scikit-learn
 
 `scikit-learn` is required for the Bake slot pitch feature (Ridge regression to build the pitch direction vector). If not installed, the checkbox is disabled and a status message explains why.
 
-`librosa` is optional — needed only for `extend_voice_analysis.py`.
+`librosa` is required for Voice Match (MFCC fingerprinting, F0 measurement, acoustic analysis). Also needed for `extend_voice_analysis.py`.
 
 ### 3. Run
 
@@ -94,6 +101,42 @@ The tool auto-detects the `voices/` folder and working directory on first launch
 4. **Blend voices** — Mixer tab. Pick voices for each slot, set weights, preview the mix. Use the **Output Speed** and **Output Pitch** sliders to tune the final result. Export as `.bin` when you're happy.
 
 5. **Use Trait Match** — Set target trait sliders in the Mixer tab → **Suggest 3 Voices**. Loads the best matches into the slots.
+
+6. **Match a real voice** — Voice Match tab. Browse to a WAV or MP3, transcribe or paste the text, Build Fingerprints (once), Find Match, Optimise Blend. Use Fine Tune and Blend Explorer to converge by ear.
+
+---
+
+## Voice Match: how it works
+
+### Find Match pipeline
+
+1. Loads reference audio, trims silence, extracts the best 8-second window by RMS energy.
+2. Measures reference F0 (fundamental frequency) with `librosa.pyin`. Filters the voice pool to voices within ±40% of that F0 — prevents wrong-gender matches.
+3. Computes weighted MFCC distance between the reference and each voice's pre-built fingerprint. Lower coefficients (timbre, formant shape) are weighted 2×; higher ones (content-dependent) are weighted 0.2–0.5×.
+4. Takes the top 12 candidates, synthesises each saying your transcript text, re-compares MFCCs against the reference. This eliminates content-mismatch contamination from the coverage sentence used to build fingerprints.
+
+For reference audio longer than 20 seconds, the pipeline averages MFCC measurements across three windows (start, middle, end) for a more stable fingerprint.
+
+### Optimise Blend
+
+Seeds 5 starting candidates (the top single voice, two 70/30 blends, a 60/25/15 three-way, and a balanced three-way). For each candidate: writes the blended embedding to a temp `.bin`, synthesises it saying the transcript text, measures MFCC distance against the reference audio. Hill-climbs with random weight and pitch mutations (±15%) until 2 consecutive iterations produce no improvement. Then runs a deterministic fine pass: tries ±5% on each voice weight and ±0.5st on each pitch slot, synthesising and scoring each, until no further improvement is found.
+
+The final distance is labelled: **excellent** (<3.0), **good** (<5.0), **fair** (<8.0), **rough** (≥8.0).
+
+### Fine Tune
+
+Sliders for each voice slot: weight (0–100, normalised to show actual contribution %) and pitch (±5 semitones). Weights are always normalised before use — 80/40/0 and 2/1/0 produce identical blends. Preview individual slots or the full blend. Export directly or load into the Mixer for further work.
+
+### Blend Explorer
+
+After optimising, the Explorer tests whether adding a small amount of another voice improves the match. Each round:
+
+1. Takes the current Fine Tune blend as a single unit.
+2. Picks the next 3 MFCC-ranked pool voices not already in the blend.
+3. For each: creates a variant = current blend (82%) + new voice (18%). Because embedding mixing is linear, this is mathematically identical to a flat multi-component recipe — no temp file needed.
+4. Synthesises A / B / C saying your transcript and offers them for comparison.
+
+Pick the closest to your target → Fine Tune updates, next round tests 3 more voices from the pool. Repeat until satisfied. Each round the injected voice either gets absorbed into the base (if picked) or discarded (if not), so the blend stays at most 3 components.
 
 ---
 
@@ -174,7 +217,7 @@ The sidecar JSON (saved alongside the `.bin`) records what voices were blended a
 - The tool saves your config (paths, slot settings, session state) to `voice_lab_config.json` automatically. This file is gitignored by default since it contains your local paths.
 - `voice_ratings.json` is also gitignored — if you want to share your ratings with someone, commit it manually or send it directly.
 - The `preview_cache/` folder holds pre-generated WAVs keyed to the test sentence. Delete it to force regeneration (e.g. after changing the test sentence). Or use **Re-cache All Voices** in the Config tab.
-- Ratings use a 1–5 scale on each axis. Trait Match distance is Manhattan distance across all rated axes.
+- Ratings use a 1–10 scale on each axis. Trait Match distance is Manhattan distance across all rated axes.
 
 ---
 
@@ -184,11 +227,11 @@ The sidecar JSON (saved alongside the `.bin`) records what voices were blended a
 |---------|----------|-------|
 | `onnxruntime` | Yes | Or `onnxruntime-gpu` for CUDA acceleration |
 | `misaki[en]` | Yes | G2P phonemiser — converts text to phoneme tokens |
-| `soundfile` | Yes | WAV read/write |
+| `soundfile` | Yes | WAV read/write; also used to decode MP3/FLAC for reference audio playback |
 | `numpy` | Yes | Voice bin arithmetic and tensor operations |
 | `scikit-learn` | Recommended | Required for Bake slot pitch; gracefully disabled if absent |
 | `Pillow` | Recommended | Logo transparency support; gracefully absent otherwise |
-| `librosa` | Optional | Required for Voice Match fingerprints and `extend_voice_analysis.py` |
+| `librosa` | Required for Voice Match | MFCC fingerprinting, F0 measurement, acoustic analysis; also needed for `extend_voice_analysis.py` |
 | `faster-whisper` | Optional | Voice Match transcription (preferred — smaller/faster) |
 | `openai-whisper` | Optional | Voice Match transcription (fallback if faster-whisper absent) |
 | `ffmpeg` | Optional | Required for non-default pitch/speed when bake is off |
@@ -212,6 +255,8 @@ This tool is built on the work of several projects:
 **[NumPy](https://numpy.org/)** — voice bin loading, tensor arithmetic, and weight normalization.
 
 **[scikit-learn](https://scikit-learn.org/)** — Ridge regression used to compute the pitch direction vector in voice embedding space for the Bake slot pitch feature.
+
+**[librosa](https://librosa.org/)** — MFCC feature extraction, F0 estimation via pyin, and acoustic analysis used throughout the Voice Match pipeline.
 
 **[Pillow](https://python-pillow.org/)** — used for logo transparency and image handling in the GUI watermark.
 
