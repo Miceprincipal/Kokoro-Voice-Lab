@@ -267,3 +267,126 @@ This tool is built on the work of several projects:
 ---
 
 *Built for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) by hexgrad.*
+
+
+---
+
+# 🔧 UPDATE: Embedding-Based Voice Matching (New Pipeline)
+
+## Architecture Change
+
+Old:
+audio → MFCC → compare → search → synth
+
+New:
+audio → feature vector → embedding → synth
+
+---
+
+## Key Additions
+
+### Canonical Embeddings
+Each voice `.bin` is reduced to a stable identity vector:
+mean(all_frames)
+
+Used for:
+- matching
+- regression targets
+- manifold projection
+
+---
+
+### New Fingerprint (Replaces MFCC stats)
+
+Features (~120–150 dims):
+- MFCC + Δ + ΔΔ
+- log-mel spectrogram
+- spectral contrast
+- F0 statistics
+
+Generated via:
+extend_voice_analysis.py
+
+---
+
+### Embedding Regressor
+
+Linear mapping:
+audio_features → Kokoro embedding
+
+Trained using:
+np.linalg.lstsq(X, Y)
+
+---
+
+### Feature Whitening
+
+(X - mean) / std
+
+Improves regression stability.
+
+---
+
+### Manifold Projection
+
+Predicted embeddings are snapped to nearest valid voices:
+mean(nearest_k canonical embeddings)
+
+Prevents:
+- crackling
+- invalid outputs
+
+---
+
+### Normalized Mixing Fix
+
+emb = emb / ||emb||
+out += emb * weight
+out /= ||out||
+
+Prevents distortion and voice collapse.
+
+---
+
+## Removed
+
+- MFCC matching pipeline
+- voice_match_mfcc.json dependency
+- hill-climb optimizer
+- blend explorer logic
+
+---
+
+## Required Migration
+
+1. Rebuild fingerprints:
+   python extend_voice_analysis.py
+
+2. Delete:
+   voice_match_mfcc.json
+
+3. Remove any broken/generated `.bin` files
+
+---
+
+## Known Constraints
+
+Kokoro embeddings are style-based, not true speaker embeddings.
+Cloning fidelity is bounded without external speaker encoder (e.g. ECAPA).
+
+---
+
+## Debugging
+
+### Crackling
+Cause:
+- off-manifold embeddings
+- invalid normalization
+
+Fix:
+- ensure projection active
+- rebuild analysis
+- remove bad .bin files
+
+---
+
