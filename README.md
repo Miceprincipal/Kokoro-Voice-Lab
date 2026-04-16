@@ -268,6 +268,7 @@ After running, restart Voice Lab (or click **Re-cache All Voices**) to rebuild t
 
 ## Notes
 
+- Cloning is... well... it's a bonus feature. A mix of the nature of Kokoro, time available, and trying to strike a balance between making an accessible tool and one that requires significant time and resources. Results can be good... Results can be good with tweaking... and results can sometimes be "... huh?". It's fun to play about with and definitely an easy way to generate new voices though. 
 - The tool saves your config (paths, slot settings, session state) to `voice_lab_config.json` automatically. This file is gitignored by default since it contains your local paths.
 - `voice_ratings.json` is also gitignored — if you want to share your ratings with someone, commit it manually or send it directly.
 - The `preview_cache/` folder holds pre-generated WAVs keyed to the test sentence. Delete it to force regeneration (e.g. after changing the test sentence). Or use **Re-cache All Voices** in the Config tab.
