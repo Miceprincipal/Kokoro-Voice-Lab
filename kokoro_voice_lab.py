@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "voice_lab_config.json"
 DEFAULT_RATINGS_PATH = APP_DIR / "voice_ratings.json"
 DEFAULT_EXPORT_DIR = APP_DIR / "exports"
-DEFAULT_ANALYSIS_CSV_PATH = APP_DIR.parent.parent / "cache" / "voice-audition" / "voice-analysis.csv"
+DEFAULT_ANALYSIS_CSV_PATH = APP_DIR / "cache" / "voice-audition" / "voice-analysis.csv"
 VOICE_MATCH_MFCC_PATH     = APP_DIR / "voice_match_mfcc.json"
 VOICE_MATCH_SPEAKER_PATH  = APP_DIR / "voice_match_speaker.json"
 VOICE_MATCH_SPEAKER_MODEL = APP_DIR / "voxceleb_resnet34.onnx"
@@ -148,13 +148,26 @@ class KokoroSynthAdapter:
     def is_configured(self) -> bool:
         return bool(self.command_template)
 
-    def synthesize(self, voice_path: Path, text: str, out_wav: Path) -> None:
+    def synthesize(self, voice_path: Path, text: str, out_wav: Path, speed: float = 1.0) -> None:
         if not self.is_configured():
             raise RuntimeError("No synthesis command configured.")
-        cmd = self.command_template.format(voice=str(voice_path), text=text, out=str(out_wav))
+        fmt: dict[str, str] = {"voice": str(voice_path), "text": text, "out": str(out_wav)}
+        if "{speed}" in self.command_template:
+            fmt["speed"] = f"{speed:.4f}"
+        cmd = self.command_template.format(**fmt)
         subprocess.run(cmd, shell=True, check=True, cwd=self.working_dir or None)
         if not out_wav.exists():
             raise RuntimeError(f"Synthesis completed but no output file: {out_wav}")
+        # If the template didn't consume {speed} and speed deviates from 1.0,
+        # apply tempo correction via ffmpeg so callers still get the right pacing.
+        if "{speed}" not in self.command_template and not self.is_identity(speed, 0.0):
+            tmp = out_wav.with_suffix("._spd.wav")
+            try:
+                self.transform_audio(out_wav, tmp, speed, 0.0)
+                tmp.replace(out_wav)
+            except Exception:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
 
     def transform_audio(self, src_wav: Path, dst_wav: Path, speed: float, pitch_semitones: float) -> None:
         """Apply speed and/or pitch shift, preserving duration for pitch-only changes.
@@ -516,7 +529,9 @@ class VoiceLabApp:
         self._vmatch_regressor: np.ndarray | None = None     # (86, 256) audio-features → emb
         self._vmatch_xvectors: dict[str, np.ndarray] = {}   # voice → 256-dim speaker x-vector
         self._vmatch_speaker_session = None                   # onnxruntime session (ResNet34)
-        self._vmatch_speaker_var = tk.StringVar(value="No model")
+        self._vmatch_speaker_var        = tk.StringVar(value="No model")
+        self._vmatch_active_mode_var    = tk.StringVar(value="— (run Find Best Voice)")
+        self._vmatch_transcript_src_var = tk.StringVar(value="")
         self._vmatch_scores: list[tuple[float, str]] = []
         self._vmatch_results_listbox: tk.Listbox | None = None
         self._vmatch_transcript_widget: tk.Text | None = None
@@ -535,7 +550,13 @@ class VoiceLabApp:
         self._vmatch_explore_b_var = tk.StringVar(value="▶  B")
         self._vmatch_explore_c_var = tk.StringVar(value="▶  C")
         self._vmatch_explore_btns: list[tk.Widget] = []  # play-A, play-B, play-C, pick-A, pick-B, pick-C
-        self._vmatch_status_label: ttk.Label | None = None
+        self._vmatch_status_label:   ttk.Label | None = None  # coloured fingerprint status label
+        # button refs for state management — set in _build_voice_match_tab
+        self._vmatch_find_btn:       tk.Widget | None = None
+        self._vmatch_optimise_btn:   tk.Widget | None = None
+        self._vmatch_load_match_btn: tk.Widget | None = None
+        self._vmatch_load_opt_btn:   tk.Widget | None = None
+        self._vmatch_xvrerank_var:   tk.BooleanVar = tk.BooleanVar(value=True)
         # Optimiser result
         self._vmatch_opt_emb:   np.ndarray | None = None
         self._vmatch_opt_cand:  list[tuple[str, float, float]] = []  # (name, weight, pitch_st)
@@ -883,7 +904,7 @@ class VoiceLabApp:
         if self._server.is_running():
             self._server.synthesize(voice_path, text, out, speed=speed)
         elif self.synth.is_configured():
-            self.synth.synthesize(voice_path, text, out)
+            self.synth.synthesize(voice_path, text, out, speed)
         else:
             raise RuntimeError("No synthesis method available. Start server or configure command.")
 
@@ -945,6 +966,20 @@ class VoiceLabApp:
             return
         self._precache_thread = threading.Thread(target=self._precache_all, daemon=True)
         self._precache_thread.start()
+
+    def clear_preview_cache(self) -> None:
+        """Delete all cached preview WAVs without re-synthesising."""
+        if self._precache_thread and self._precache_thread.is_alive():
+            self._precache_stop.set()
+        wavs = list(PREVIEW_CACHE_DIR.glob("*.wav"))
+        deleted = 0
+        for f in wavs:
+            try:
+                f.unlink()
+                deleted += 1
+            except OSError:
+                pass
+        self.precache_var.set(f"Cache cleared — {deleted} file{'s' if deleted != 1 else ''} removed")
 
     def recache_voices(self) -> None:
         """Delete all cached preview WAVs and re-synthesise from scratch, then rebuild pitch axis."""
@@ -1238,6 +1273,7 @@ class VoiceLabApp:
         ttk.Button(sv_row, text="■  Stop", command=self._server_stop).pack(side="left", padx=(6, 0))
         ttk.Button(sv_row, text="Pre-cache All Voices", command=self.start_precache).pack(side="left", padx=(12, 0))
         ttk.Button(sv_row, text="Re-cache All Voices", command=self.recache_voices).pack(side="left", padx=(6, 0))
+        ttk.Button(sv_row, text="Clear Cache", command=self.clear_preview_cache).pack(side="left", padx=(6, 0))
         ttk.Label(sv_row, textvariable=self.server_status_var,
                   font=("Segoe UI", 9, "bold"), foreground="#0055aa").pack(side="left", padx=(12, 0))
         ttk.Label(sv_row, textvariable=self.precache_var,
@@ -1249,10 +1285,10 @@ class VoiceLabApp:
         # ── Fallback command ──────────────────────────────────────────────────
         cf = ttk.LabelFrame(parent, text="Fallback: External Command  (used only if server is not running)", padding=10)
         cf.pack(fill="x")
-        ttk.Label(cf, text="Command template  ({voice} {text} {out})",
+        ttk.Label(cf, text="Command template  ({voice} {text} {out} {speed})",
                   font=("Segoe UI", 9)).grid(row=0, column=0, sticky="w")
         ttk.Entry(cf, textvariable=self.command_var, width=100).grid(row=0, column=1, sticky="ew", padx=(8, 0))
-        ttk.Label(cf, text='Example: python infer.py --voice "{voice}" --text "{text}" --output "{out}"',
+        ttk.Label(cf, text='Example: python infer.py --voice "{voice}" --text "{text}" --output "{out}" --speed "{speed}"',
                   foreground="#666", font=("Segoe UI", 8)).grid(row=1, column=1, sticky="w", pady=(2, 0))
         ttk.Label(cf, text="Working dir").grid(row=2, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(cf, textvariable=self.working_dir_var, width=100).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
@@ -1290,8 +1326,13 @@ class VoiceLabApp:
                   foreground="#555", font=("Segoe UI", 8)).grid(
                       row=2, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
 
+        ttk.Label(mod, text="Active matcher:").grid(row=3, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(mod, textvariable=self._vmatch_active_mode_var,
+                  foreground="#335", font=("Segoe UI", 8, "italic")).grid(
+                      row=3, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
+
         btn_row = ttk.Frame(mod)
-        btn_row.grid(row=0, column=2, rowspan=3, sticky="ne", padx=(12, 0))
+        btn_row.grid(row=0, column=2, rowspan=4, sticky="ne", padx=(12, 0))
         ttk.Button(btn_row, text="Build Fingerprints",
                    command=self.vmatch_build).pack(side="top", fill="x")
         ttk.Button(btn_row, text="Get Speaker Model (~26 MB)",
@@ -1336,10 +1377,16 @@ class VoiceLabApp:
 
         act_row = ttk.Frame(res)
         act_row.pack(fill="x", pady=(0, 2))
-        ttk.Button(act_row, text="Find Match",
-                   command=self.vmatch_find_match).pack(side="left")
-        ttk.Button(act_row, text="Optimise Blend",
-                   command=self.vmatch_optimise).pack(side="left", padx=(8, 0))
+        _find_btn = ttk.Button(act_row, text="Find Best Voice",
+                               command=self.vmatch_find_match, state="disabled")
+        _find_btn.pack(side="left")
+        self._vmatch_find_btn = _find_btn
+        _opt_btn = ttk.Button(act_row, text="Build Best Blend",
+                              command=self.vmatch_optimise, state="disabled")
+        _opt_btn.pack(side="left", padx=(8, 0))
+        self._vmatch_optimise_btn = _opt_btn
+        ttk.Checkbutton(act_row, text="x-vec rerank",
+                        variable=self._vmatch_xvrerank_var).pack(side="left", padx=(8, 0))
         ttk.Button(act_row, text="▶  Preview",
                    command=self.vmatch_preview_result).pack(side="left", padx=(8, 0))
         ttk.Button(act_row, text="■  Stop",
@@ -1347,25 +1394,30 @@ class VoiceLabApp:
 
         opt_row = ttk.Frame(res)
         opt_row.pack(fill="x", pady=(2, 0))
-        ttk.Button(opt_row, text="Load Match → Mixer",
-                   command=self.vmatch_load_to_mixer).pack(side="left")
-        ttk.Button(opt_row, text="Load Optimised → Mixer",
-                   command=self.vmatch_load_opt_to_mixer).pack(side="left", padx=(8, 0))
+        _load_match_btn = ttk.Button(opt_row, text="Send Base Voice → Mixer",
+                                     command=self.vmatch_load_to_mixer, state="disabled")
+        _load_match_btn.pack(side="left")
+        self._vmatch_load_match_btn = _load_match_btn
+        _load_opt_btn = ttk.Button(opt_row, text="Send Blend → Mixer",
+                                   command=self.vmatch_load_opt_to_mixer, state="disabled")
+        _load_opt_btn.pack(side="left", padx=(8, 0))
+        self._vmatch_load_opt_btn = _load_opt_btn
 
-        ttk.Label(res,
-                  text=(
-                      "1.  Browse to a reference WAV or MP3.  ▶ Play to audition it.\n"
-                      "2.  Transcribe (Whisper) or paste the spoken text — used for synthesis during matching.\n"
-                      "3.  Find Match — F0-gates the pool by pitch, then ranks all voices by MFCC distance.\n"
-                      "4.  Optimise Blend — synthesises candidates, hill-climbs weights/pitch against your\n"
-                      "       reference audio, then runs a fine local pass.  Result loads into Fine Tune.\n"
-                      "5.  Fine Tune — tweak per-slot weight and pitch, ▶ preview each slot or the full blend,\n"
-                      "       Export or send to Mixer.  Weight labels show normalised contribution %.\n"
-                      "6.  Blend Explorer — each round injects 3 pool voices (18%) into your current blend.\n"
-                      "       Play A / B / C, pick the closest — Fine Tune updates, repeat to converge."
-                  ),
-                  foreground="#888", font=("Segoe UI", 8), justify="left",
-                  ).pack(anchor="w", pady=(10, 0))
+        guide = ttk.Frame(res)
+        guide.pack(anchor="w", pady=(10, 0))
+        _g = ("Segoe UI", 8)
+        _gb = ("Segoe UI", 8, "bold")
+        for col, (heading, lines) in enumerate((
+            ("① Reference",  ["Browse to a WAV or MP3", "Transcribe or paste text"]),
+            ("② Setup",      ["Build Fingerprints", "Get Speaker Model (optional)"]),
+            ("③ Match",      ["Find Best Voice", "Build Best Blend"]),
+            ("④ Refine",     ["Fine Tune weights & pitch", "Send to Mixer / Export"]),
+        )):
+            ttk.Label(guide, text=heading, font=_gb, foreground="#444").grid(
+                row=0, column=col, sticky="w", padx=(0 if col == 0 else 12, 0))
+            for row, line in enumerate(lines, 1):
+                ttk.Label(guide, text=f"  {line}", font=_g, foreground="#888").grid(
+                    row=row, column=col, sticky="w", padx=(0 if col == 0 else 12, 0))
 
         # ── RIGHT: transcript + Fine Tune + Blend Explorer ────────────────────
         right = ttk.Frame(body)
@@ -1377,15 +1429,29 @@ class VoiceLabApp:
         tx_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         tx_frame.columnconfigure(0, weight=1)
 
+        ttk.Label(tx_frame, textvariable=self._vmatch_transcript_src_var,
+                  foreground="#888", font=("Segoe UI", 7, "italic"),
+                  ).grid(row=0, column=0, sticky="w", pady=(0, 2))
         tx = tk.Text(tx_frame, height=4, wrap="word", font=("Segoe UI", 9))
-        tx.grid(row=0, column=0, sticky="ew")
+        tx.grid(row=1, column=0, sticky="ew")
         self._vmatch_transcript_widget = tx
+
+        def _on_tx_edit(_event=None) -> None:
+            content = tx.get("1.0", "end").strip()
+            if content:
+                src = self._vmatch_transcript_src_var.get()
+                if not src or src.startswith("Missing"):
+                    self._vmatch_transcript_src_var.set("Manually entered")
+            else:
+                self._vmatch_transcript_src_var.set("Missing — quality may drop without transcript")
+        tx.bind("<KeyRelease>", _on_tx_edit)
+
         ttk.Button(tx_frame, text="Transcribe (Whisper)",
-                   command=self.vmatch_transcribe).grid(row=0, column=1, sticky="n", padx=(6, 0))
+                   command=self.vmatch_transcribe).grid(row=1, column=1, sticky="n", padx=(6, 0))
         ttk.Label(tx_frame,
-                  text="Matching uses MFCC, not text. Transcript is used for synthesis during re-rank and preview.",
+                  text="Used for synthesis during re-rank and preview. More accurate transcript = better match.",
                   foreground="#888", font=("Segoe UI", 8), wraplength=340,
-                  ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                  ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         # Fine Tune
         ft = ttk.LabelFrame(right, text="  Fine Tune  ", padding=8)
@@ -1594,6 +1660,8 @@ class VoiceLabApp:
         else:
             self._vmatch_speaker_var.set("No model")
 
+        self._vmatch_refresh_button_states()
+
     def _vmatch_set_status(self, msg: str, error: bool = False) -> None:
         """Update the fingerprint status label — red+large on error, normal otherwise."""
         self._vmatch_status_var.set(msg)
@@ -1604,6 +1672,24 @@ class VoiceLabApp:
             else:
                 self._vmatch_status_label.config(
                     foreground="#555", font=("Segoe UI", 9))
+
+    def _vmatch_refresh_button_states(self) -> None:
+        """Enable / disable Voice Match action buttons based on pipeline readiness."""
+        has_fp  = bool(self._vmatch_mfcc_db)
+        has_res = bool(self._vmatch_scores)
+        has_opt = bool(getattr(self, "_vmatch_opt_cand", None))
+
+        def _state(flag: bool) -> str:
+            return "normal" if flag else "disabled"
+
+        if self._vmatch_find_btn:
+            self._vmatch_find_btn.config(state=_state(has_fp))
+        if self._vmatch_optimise_btn:
+            self._vmatch_optimise_btn.config(state=_state(has_res))
+        if self._vmatch_load_match_btn:
+            self._vmatch_load_match_btn.config(state=_state(has_res))
+        if self._vmatch_load_opt_btn:
+            self._vmatch_load_opt_btn.config(state=_state(has_opt))
 
     def _vmatch_load_speaker_model(self) -> bool:
         """Lazy-load the ResNet34 ONNX speaker model. Returns True if available."""
@@ -1770,6 +1856,7 @@ class VoiceLabApp:
                 msg += f"  ({fail_count} failed — check server is running)"
             _status(msg)
             _prog("")
+            self.root.after(0, self._vmatch_refresh_button_states)
 
         except Exception as exc:
             _status(f"Build failed: {exc}", error=True)
@@ -1842,6 +1929,7 @@ class VoiceLabApp:
         if self._vmatch_transcript_widget:
             self._vmatch_transcript_widget.delete("1.0", "end")
             self._vmatch_transcript_widget.insert("1.0", text)
+        self._vmatch_transcript_src_var.set(f"Loaded from {txt.name}")
         self.status_var.set(f"Transcript loaded from {txt.name}")
         return True
 
@@ -1852,7 +1940,10 @@ class VoiceLabApp:
         )
         if path:
             self._vmatch_ref_var.set(path)
-            self._vmatch_load_transcript_if_exists(path)
+            loaded = self._vmatch_load_transcript_if_exists(path)
+            if not loaded:
+                self._vmatch_transcript_src_var.set(
+                    "Missing — quality may drop without transcript")
 
     def vmatch_play_reference(self) -> None:
         path = self._vmatch_ref_var.get().strip()
@@ -1914,6 +2005,7 @@ class VoiceLabApp:
                     self._vmatch_transcript_widget.insert("1.0", text)
                 # Save sidecar — skip if text looks like an error placeholder
                 if text and not text.startswith("["):
+                    self._vmatch_transcript_src_var.set("Transcribed by Whisper")
                     try:
                         self._vmatch_transcript_path(ref).write_text(
                             text, encoding="utf-8")
@@ -1922,6 +2014,8 @@ class VoiceLabApp:
                     except OSError:
                         self.status_var.set("Transcription complete (could not save sidecar)")
                 else:
+                    self._vmatch_transcript_src_var.set(
+                        "Missing — quality may drop without transcript")
                     self.status_var.set("Transcription complete")
             self.root.after(0, update)
 
@@ -2103,19 +2197,20 @@ class VoiceLabApp:
             pop_std:   np.ndarray | None = None
             ref_norm:  np.ndarray | None = None
             ref_xvec:  np.ndarray | None = None
-            _rerank_emb = False  # True → Mode A: raw cosine in feature space
-            _mode_s     = False  # True → Mode S: speaker encoder x-vector
+            _rerank_emb    = False   # True → Mode A: raw cosine in feature space
+            _mode_s        = False   # True → Mode S: speaker encoder x-vector
+            _active_label  = "—"    # shown in Active matcher row after search
+            _result_tag    = ""     # per-result provenance tag in listbox
 
             if self._vmatch_xvectors and self._vmatch_load_speaker_model():
                 # ── Mode S: speaker-encoder (ResNet34 ONNX) ───────────────────
-                # human reference → 256-dim x-vector → cosine to gallery x-vectors
-                # Gallery was built from synthesised Kokoro audio — same encoder,
-                # so human↔synthetic comparison is in a consistent embedding space.
                 try:
                     self.root.after(0, lambda: self.status_var.set(
-                        "Extracting speaker embedding (Mode S)…"))
+                        "Extracting speaker embedding…"))
                     ref_xvec = self._vmatch_extract_xvector(y, sr)
-                    mode_note = "  [speaker-encoder]"
+                    mode_note    = "  [speaker match]"
+                    _active_label = "Speaker match"
+                    _result_tag  = "[spkr]"
                     _mode_s = True
                     for name, xvec in self._vmatch_xvectors.items():
                         acoustic_row = self._acoustic.get(name, {})
@@ -2124,17 +2219,19 @@ class VoiceLabApp:
                             continue
                         coarse.append((_cosine_dist(ref_xvec, xvec), name))
                         passed += 1
-                except Exception:
-                    _mode_s = False  # fall through to Mode A below
+                except Exception as exc:
+                    _mode_s = False
+                    self.root.after(0, lambda e=str(exc): self.status_var.set(
+                        f"Speaker match unavailable — using fast match  ({e})"))
 
             if not _mode_s and _fmt2 and self._vmatch_regressor is not None and self._vmatch_canonical:
-                # ── Mode A: embedding-space (preferred) ───────────────────────
-                # audio → 86-dim → regressor → predicted 256-dim embedding
-                # → cosine distance to each voice's canonical embedding
+                # ── Mode A: embedding-space ────────────────────────────────────
                 self.root.after(0, lambda: self.status_var.set("Extracting reference features…"))
                 ref_feats = _extract_feats(all_windows)
                 pred_emb  = (ref_feats @ self._vmatch_regressor).astype(np.float32)
-                mode_note = "  [embedding-space]"
+                mode_note    = "  [fast match]"
+                _active_label = "Fast match (embedding)"
+                _result_tag  = "[emb]"
                 _rerank_emb = True
                 for name, can_emb in self._vmatch_canonical.items():
                     acoustic_row = self._acoustic.get(name, {})
@@ -2161,7 +2258,9 @@ class VoiceLabApp:
                 pop_std  = pop_mat.std(axis=0) + 1e-8
                 ref_norm = (ref_feats - pop_mean) / pop_std
                 fp_norm  = {n: (v - pop_mean) / pop_std for n, v in fp_raw.items()}
-                mode_note = "  [audio-space, rebuild for embedding match]"
+                mode_note    = "  [fast match, no regressor]"
+                _active_label = "Fast match (audio features — rebuild for embedding)"
+                _result_tag  = "[aud]"
                 for name, vec in fp_norm.items():
                     acoustic_row = self._acoustic.get(name, {})
                     if not f0_ok(acoustic_row.get("f0_hz", "")):
@@ -2173,7 +2272,7 @@ class VoiceLabApp:
             elif not _mode_s:
                 # ── Mode C: legacy fingerprints (MFCC mean+std, L2) ───────────
                 self.root.after(0, lambda: self.status_var.set(
-                    "Legacy fingerprints — rebuild for embedding-space matching"))
+                    "Legacy fingerprints — rebuild recommended"))
                 mfcc_weights = np.array(
                     [2.0, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2,
                      1.5, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1],
@@ -2184,7 +2283,9 @@ class VoiceLabApp:
                     m = librosa.feature.mfcc(y=w, sr=sr, n_mfcc=13)
                     vecs.append(np.concatenate([m.mean(axis=1), m.std(axis=1)]))
                 ref_vec_legacy = np.mean(vecs, axis=0) * mfcc_weights
-                mode_note = "  [legacy MFCC — rebuild recommended]"
+                mode_note    = "  [legacy — rebuild recommended]"
+                _active_label = "Legacy match — rebuild fingerprints"
+                _result_tag  = "[lgcy]"
                 for name, fp in self._vmatch_mfcc_db.items():
                     if "mean" not in fp:
                         continue
@@ -2260,13 +2361,16 @@ class VoiceLabApp:
             self._vmatch_scores = reranked
 
             def update() -> None:
+                self._vmatch_active_mode_var.set(_active_label)
+                self._vmatch_refresh_button_states()
                 if self._vmatch_results_listbox:
                     self._vmatch_results_listbox.delete(0, "end")
                     self._vmatch_results_listbox.insert("end", f"  [ {note} ]")
                     self._vmatch_results_listbox.insert("end", f"  [ {gate_note} ]")
+                    tag = f"  {_result_tag}" if _result_tag else ""
                     for rank, (dist, name) in enumerate(reranked[:10], 1):
                         self._vmatch_results_listbox.insert(
-                            "end", f"  {rank:2}.  {name:<22}  dist = {dist:.3f}")
+                            "end", f"  {rank:2}.  {name:<22}  {dist:.3f}{tag}")
                 self.status_var.set(
                     f"Best match: {reranked[0][1]}  (ref F0 ≈ {f0_label})"
                     if reranked else "No results")
@@ -2276,22 +2380,32 @@ class VoiceLabApp:
 
     def vmatch_load_to_mixer(self) -> None:
         if not self._vmatch_scores:
-            self.status_var.set("Run Find Match first.")
+            self.status_var.set("Run Find Best Voice first.")
             return
         top = self._vmatch_scores[:3]
         inv = [1.0 / (d + 1e-9) for d, _ in top]
         total_inv = sum(inv)
         weights = [100.0 * v / total_inv for v in inv]
-        for i, ((dist, name), w) in enumerate(zip(top, weights)):
-            self.active_vars[i].set(True)
-            self.voice_vars[i].set(name)
-            self.weight_vars[i].set(round(w, 1))
+        for i in range(3):
+            if i < len(top):
+                _, name = top[i]
+                self.active_vars[i].set(True)
+                self.voice_vars[i].set(name)
+                self.weight_vars[i].set(round(weights[i], 1))
+                self.pitch_vars[i].set(0.0)
+                self.speed_vars[i].set(1.0)
+            else:
+                self.active_vars[i].set(False)
+                self.voice_vars[i].set("")
+                self.weight_vars[i].set(0.0)
+                self.pitch_vars[i].set(0.0)
+                self.speed_vars[i].set(1.0)
         self.status_var.set("Top 3 loaded into Mixer — switch to Mixer tab to preview")
         self._recompute_summary()
 
     def vmatch_export_direct(self) -> None:
         if not self._vmatch_scores:
-            self.status_var.set("Run Find Match first.")
+            self.status_var.set("Run Find Best Voice first.")
             return
         if not self._require_voices():
             return
@@ -2303,7 +2417,7 @@ class VoiceLabApp:
     def vmatch_preview_result(self) -> None:
         """Synthesise and play the current top-3 blend using the match text."""
         if not self._vmatch_scores:
-            self.status_var.set("Run Find Match first.")
+            self.status_var.set("Run Find Best Voice first.")
             return
         if not self._require_voices() or not self._can_synthesize():
             messagebox.showerror(APP_TITLE, "Start the server first.")
@@ -2444,15 +2558,18 @@ class VoiceLabApp:
         for i in range(3):
             if i < len(recipe):
                 name, w, pitch = recipe[i]
+                self.active_vars[i].set(True)
                 if name in voice_names:
                     self.voice_vars[i].set(name)
                 self.weight_vars[i].set(round(w * 100))
                 self.pitch_vars[i].set(pitch)
-                self.active_vars[i].set(True)
+                self.speed_vars[i].set(1.0)
             else:
                 self.active_vars[i].set(False)
+                self.voice_vars[i].set("")
                 self.weight_vars[i].set(0)
                 self.pitch_vars[i].set(0.0)
+                self.speed_vars[i].set(1.0)
         if self.pitch_axis.available:
             self.bake_pitch_var.set(True)
         self.status_var.set("Fine Tune blend → Mixer (pitch bake on)")
@@ -3183,17 +3300,6 @@ class VoiceLabApp:
             self.root.after(0, lambda m=msg: self.status_var.set(m))
             self.root.after(0, lambda m=msg: self._vmatch_progress_var.set(m))
 
-        def _extract_vec(y: np.ndarray, sr: int) -> np.ndarray:
-            """78-dim: MFCC+Δ+ΔΔ mean+std — stable for audio-to-audio comparison."""
-            m  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-            d  = librosa.feature.delta(m)
-            d2 = librosa.feature.delta(m, order=2)
-            return np.concatenate([
-                m.mean(axis=1),  m.std(axis=1),
-                d.mean(axis=1),  d.std(axis=1),
-                d2.mean(axis=1), d2.std(axis=1),
-            ]).astype(np.float32)
-
         def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
             na, nb = np.linalg.norm(a), np.linalg.norm(b)
             if na < 1e-8 or nb < 1e-8:
@@ -3203,20 +3309,65 @@ class VoiceLabApp:
         prog("Optimise: preparing reference audio…")
         try:
             y_ref, sr_ref, _ = self._vmatch_prepare_audio(ref_path)
-            ref_vec = _extract_vec(y_ref, sr_ref)
         except Exception as exc:
             prog(f"Optimise: reference error — {exc}")
             return
 
-        synth_text = self._vmatch_match_text()
-        call_idx = [0]
+        # ── Scoring mode selection ────────────────────────────────────────────
+        # Embedding mode: project ref audio → 86-dim features → regressor →
+        # target embedding, then compare blended canonical embeddings to it.
+        # Fast (no synthesis), discriminative (each voice has a unique canonical),
+        # directly measures what blend optimisation is trying to achieve.
+        #
+        # Acoustic fallback: synthesize each candidate, compare 78-dim MFCC
+        # cosine to reference. Used when fingerprints haven't been built yet.
+        use_emb = (
+            self._vmatch_regressor is not None
+            and bool(self._vmatch_canonical)
+        )
 
-        # ── Speed calibration ─────────────────────────────────────────────────
-        # Measure how long the reference speaker actually takes to say the
-        # transcript, then find the Kokoro speed multiplier that matches it.
-        # This prevents the optimiser from matching a voice that happens to
-        # run fast against a slow reference (or vice versa).
-        opt_speed = 1.0
+        target_emb: np.ndarray | None = None
+        ref_vec:    np.ndarray | None = None
+
+        def _extract_86(y: np.ndarray, sr: int) -> np.ndarray:
+            """86-dim features matching the fingerprint extractor."""
+            mfcc     = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+            delta    = librosa.feature.delta(mfcc)
+            delta2   = librosa.feature.delta(mfcc, order=2)
+            mel      = np.log(librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40) + 1e-6)
+            contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+            return np.concatenate([
+                mfcc.mean(axis=1), delta.mean(axis=1), delta2.mean(axis=1),
+                mel.mean(axis=1),  contrast.mean(axis=1),
+            ]).astype(np.float32)
+
+        def _extract_78(y: np.ndarray, sr: int) -> np.ndarray:
+            """78-dim MFCC+Δ+ΔΔ mean+std for acoustic fallback."""
+            m  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+            d  = librosa.feature.delta(m)
+            d2 = librosa.feature.delta(m, order=2)
+            return np.concatenate([
+                m.mean(axis=1), m.std(axis=1),
+                d.mean(axis=1), d.std(axis=1),
+                d2.mean(axis=1), d2.std(axis=1),
+            ]).astype(np.float32)
+
+        try:
+            if use_emb:
+                feats = _extract_86(y_ref, sr_ref)
+                target_emb = (feats @ self._vmatch_regressor).astype(np.float32)
+                prog("Optimise: embedding mode — target computed")
+            else:
+                ref_vec = _extract_78(y_ref, sr_ref)
+                prog("Optimise: acoustic mode — build fingerprints for faster/better optimisation")
+        except Exception as exc:
+            prog(f"Optimise: reference processing error — {exc}")
+            return
+
+        # ── Speed calibration (kept in both modes — used for Fine Tune) ───────
+        synth_text = self._vmatch_match_text()
+        call_idx   = [0]
+        opt_speed  = 1.0
         try:
             prog("Optimise: calibrating speed to reference pacing…")
             y_full, sr_full = librosa.load(ref_path, sr=22050, mono=True)
@@ -3224,9 +3375,6 @@ class VoiceLabApp:
             if len(y_trim) < sr_full * 0.5:
                 y_trim = y_full
             ref_speech_dur = len(y_trim) / sr_full
-
-            # Synthesize the transcript with the top-ranked voice at 1× to
-            # establish Kokoro's natural duration for this text.
             voice_pool_pre = [name for _, name in self._vmatch_scores[:8]]
             if voice_pool_pre:
                 cal_bin = self.temp_dir / "_cal_speed.bin"
@@ -3251,8 +3399,31 @@ class VoiceLabApp:
             opt_speed = 1.0
             prog(f"Optimise: speed calibration skipped ({_cal_exc})")
 
-        def score_emb(arr: np.ndarray) -> float:
-            if arr is None:
+        # ── Embedding-space scorer ────────────────────────────────────────────
+        def score_cand_emb(cand: list) -> float:
+            """Blend canonical embeddings (with optional pitch shift) and cosine
+            against the regressor-predicted target. No synthesis needed."""
+            active = [(n, w, p) for n, w, p in cand if w > 0.02]
+            if not active or target_emb is None:
+                return 999.0
+            ws = np.array([w for _, w, _ in active], dtype=np.float32)
+            ws /= ws.sum()
+            result: np.ndarray | None = None
+            for (name, _, pitch_st), weight in zip(active, ws):
+                emb = self._vmatch_canonical.get(name)
+                if emb is None:
+                    continue
+                emb = emb.copy()
+                if self.pitch_axis.available and abs(pitch_st) > 0.1:
+                    emb = self.pitch_axis.shift(emb, pitch_st)
+                result = emb * weight if result is None else result + emb * weight
+            return 999.0 if result is None else _cosine_dist(target_emb, result)
+
+        # ── Acoustic scorer (fallback) ────────────────────────────────────────
+        def score_cand_acoustic(cand: list) -> float:
+            """Synthesize the blend and compare 78-dim MFCC cosine to reference."""
+            arr = self._vmatch_build_embedding(cand)
+            if arr is None or ref_vec is None:
                 return 999.0
             tag = f"opt{call_idx[0]}"
             call_idx[0] += 1
@@ -3260,12 +3431,9 @@ class VoiceLabApp:
             wav_tmp = self.temp_dir / f"_{tag}.wav"
             VoiceLibrary.save_bin(arr, bin_tmp)
             try:
-                # _do_synthesize is safe to call concurrently — PersistentSynthServer
-                # serializes requests internally via its own threading.Lock.
                 self._do_synthesize(bin_tmp, synth_text, wav_tmp, speed=opt_speed)
                 y, _ = librosa.load(str(wav_tmp), sr=sr_ref, mono=True)
-                cand_vec = _extract_vec(y, sr_ref)
-                return _cosine_dist(ref_vec, cand_vec)
+                return _cosine_dist(ref_vec, _extract_78(y, sr_ref))
             except Exception:
                 return 999.0
             finally:
@@ -3275,55 +3443,59 @@ class VoiceLabApp:
                     except OSError:
                         pass
 
-        # Voice pool — top voices from MFCC screen
+        score = score_cand_emb if use_emb else score_cand_acoustic
+        # Pitch search: canonical emb pitch-shift needs pitch_axis in both modes
+        pitch_ok = self.pitch_axis.available
+        if not pitch_ok:
+            prog("Optimise: pitch axis unavailable — searching weights/voice swaps only")
+
+        def _norm_cand(cand: list) -> list[tuple[str, float, float]]:
+            """Normalise weights to sum=1, drop near-zero slots, cap at 3."""
+            active = [(n, max(0.01, w), p) for n, w, p in cand if w > 0.01]
+            s = sum(w for _, w, _ in active) or 1.0
+            return [(n, w / s, p) for n, w, p in active[:3]]
+
+        # Voice pool — top voices from coarse screen
         voice_pool = [name for _, name in self._vmatch_scores[:8]]
         top = voice_pool[:5]
         if not top:
-            prog("Optimise: run Find Match first")
+            prog("Optimise: run Find Best Voice first")
             return
 
-        # Initial candidate set
-        inits: list[list[tuple[str, float, float]]] = [
+        # Initial candidate set — normalised before scoring
+        raw_inits: list[list[tuple[str, float, float]]] = [
             [(top[0], 1.0, 0.0)],
         ]
         if len(top) >= 2:
-            inits += [
+            raw_inits += [
                 [(top[0], 0.70, 0.0), (top[1], 0.30, 0.0)],
                 [(top[0], 0.50, 0.0), (top[1], 0.50, 0.0)],
             ]
         if len(top) >= 3:
-            inits += [
+            raw_inits += [
                 [(top[0], 0.60, 0.0), (top[1], 0.25, 0.0), (top[2], 0.15, 0.0)],
                 [(top[0], 0.34, 0.0), (top[1], 0.33, 0.0), (top[2], 0.33, 0.0)],
             ]
-
-        prog(f"Optimise: scoring {len(inits)} starting candidates…")
-        best_dist = 999.0
-        best_cand: list[tuple[str, float, float]] = inits[0]
-        for i, cand in enumerate(inits):
-            prog(f"Optimise: initial {i+1}/{len(inits)}: {self._vmatch_fmt(cand)}")
-            emb = self._vmatch_build_embedding(cand)
-            d = score_emb(emb)
-            if d < best_dist:
-                best_dist, best_cand = d, cand
-
-        prog(f"Optimise: baseline {self._vmatch_fmt(best_cand)}  dist={best_dist:.3f}")
+        inits = [_norm_cand(c) for c in raw_inits]
 
         def mutate(cand: list[tuple[str, float, float]]) -> list[tuple[str, float, float]]:
             c = [list(x) for x in cand]
-            choice = rng.choice(["weight", "weight", "pitch", "pitch", "swap"])
+            choices = ["weight", "weight", "weight", "swap", "swap"]
+            if pitch_ok:
+                choices += ["pitch", "pitch"]
+            choice = rng.choice(choices)
 
             if choice == "weight" and len(c) > 0:
                 idx = int(rng.integers(len(c)))
                 w_scale = max(x[1] for x in c)
-                delta = float(rng.uniform(-0.15, 0.15)) * w_scale
-                c[idx][1] = max(0.05, c[idx][1] + delta)
+                delta = float(rng.uniform(-0.30, 0.30)) * w_scale
+                c[idx][1] = max(0.01, c[idx][1] + delta)
                 if len(c) > 1:
-                    c = [x for x in c if x[1] > 0.03]
+                    c = [x for x in c if x[1] > 0.01]
 
-            elif choice == "pitch" and self.pitch_axis.available:
+            elif choice == "pitch":
                 idx = int(rng.integers(len(c)))
-                delta = float(rng.uniform(-1.0, 1.0))
+                delta = float(rng.uniform(-1.5, 1.5))
                 c[idx][2] = float(np.clip(c[idx][2] + delta, -5.0, 5.0))
 
             elif choice == "swap":
@@ -3333,99 +3505,125 @@ class VoiceLabApp:
                     new_name = alternatives[int(rng.integers(len(alternatives)))]
                     c.append([new_name, 0.15, 0.0])
                 elif alternatives and len(c) >= 2:
-                    lightest = min(range(len(c)), key=lambda i: c[i][1])
+                    lightest = min(range(len(c)), key=lambda ii: c[ii][1])
                     new_name = alternatives[int(rng.integers(len(alternatives)))]
                     c[lightest] = [new_name, c[lightest][1], 0.0]
 
-            return [tuple(x) for x in c] if c else cand  # type: ignore[return-value]
+            return _norm_cand([tuple(x) for x in c]) if c else cand  # type: ignore[return-value]
 
-        # Hill climbing
-        no_improve = 0
-        MAX_ITER, N_MUT = 10, 6
+        # ── Beam search ───────────────────────────────────────────────────────
+        # Seed beam from all initial candidates, keep top BEAM_K.
+        # Each round: mutate every beam member, score all children, merge with
+        # beam, dedup, keep top BEAM_K.  Prevents single-seed dominance.
+        BEAM_K = 4
+        N_MUT_PER_PARENT = 4 if use_emb else 3
+        MAX_ITER = 10 if use_emb else 8
+
+        prog(f"Optimise: seeding beam from {len(inits)} starting candidates…")
+        beam: list[tuple[float, list[tuple[str, float, float]]]] = []
+        for i, cand in enumerate(inits):
+            prog(f"Optimise: initial {i+1}/{len(inits)}: {self._vmatch_fmt(cand)}")
+            d = score(cand)
+            beam.append((d, cand))
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:BEAM_K]
+        best_dist, best_cand = beam[0]
+        prog(f"Optimise: beam seeded — best {self._vmatch_fmt(best_cand)}  dist={best_dist:.3f}")
+
         for iteration in range(MAX_ITER):
-            improved = False
-            for mi in range(N_MUT):
-                m_cand = mutate(best_cand)
-                prog(f"Optimise iter {iteration+1}/{MAX_ITER}  mut {mi+1}/{N_MUT}: "
-                     f"{self._vmatch_fmt(m_cand)}")
-                emb = self._vmatch_build_embedding(m_cand)
-                d = score_emb(emb)
-                if d < best_dist:
-                    best_dist, best_cand = d, m_cand
-                    improved = True
-            if not improved:
-                no_improve += 1
-                if no_improve >= 2:
-                    break
-            else:
-                no_improve = 0
+            pool: list[tuple[float, list[tuple[str, float, float]]]] = list(beam)
+            for _, parent in beam:
+                for mi in range(N_MUT_PER_PARENT):
+                    child = mutate(parent)
+                    prog(f"Optimise iter {iteration+1}/{MAX_ITER}: {self._vmatch_fmt(child)}")
+                    d = score(child)
+                    pool.append((d, child))
 
-        # ── Fine local refinement pass ─────────────────────────────────────────
-        # Hill-climbing stops when ±15% mutations stop helping. Do a deterministic
-        # tight grid (±5% on each weight, ±0.5st on each pitch) to squeeze the last
-        # bit without randomness. Cost: 2 × n_slots passes of synthesis calls.
+            # Dedup by recipe signature, keep top BEAM_K
+            dedup: dict[str, tuple[float, list[tuple[str, float, float]]]] = {}
+            for d, cand in pool:
+                sig = "|".join(f"{n}:{w:.3f}:{p:.2f}" for n, w, p in cand)
+                if sig not in dedup or d < dedup[sig][0]:
+                    dedup[sig] = (d, cand)
+            beam = sorted(dedup.values(), key=lambda x: x[0])[:BEAM_K]
+
+            if beam[0][0] < best_dist:
+                best_dist, best_cand = beam[0]
+
+        prog(f"Optimise: beam done — best {self._vmatch_fmt(best_cand)}  dist={best_dist:.3f}")
+
+        # ── Fine local refinement pass ────────────────────────────────────────
         prog("Optimise: fine-tuning around best candidate…")
         FINE_DELTA_W, FINE_DELTA_P = 0.05, 0.5
-        MAX_FINE_ITERS = 5
+        MAX_FINE_ITERS = 8 if use_emb else 5
         fine_improved = True
         fine_iter = 0
         while fine_improved and fine_iter < MAX_FINE_ITERS:
             fine_iter += 1
             fine_improved = False
-            c = [list(x) for x in best_cand]
-            for i in range(len(c)):
+            for i in range(len(best_cand)):
                 for dw in (-FINE_DELTA_W, +FINE_DELTA_W):
-                    trial = [list(x) for x in best_cand]
-                    trial[i][1] = max(0.03, trial[i][1] + dw)
-                    trial_tup = [tuple(x) for x in trial]  # type: ignore[misc]
+                    trial = _norm_cand([
+                        (n, max(0.01, w + dw if j == i else w), p)
+                        for j, (n, w, p) in enumerate(best_cand)
+                    ])
                     prog(f"Optimise: fine weight slot {i+1} {dw:+.0%} → "
-                         f"{self._vmatch_fmt(trial_tup)}")
-                    d = score_emb(self._vmatch_build_embedding(trial_tup))
+                         f"{self._vmatch_fmt(trial)}")
+                    d = score(trial)
                     if d < best_dist:
-                        best_dist, best_cand = d, trial_tup
+                        best_dist, best_cand = d, trial
                         fine_improved = True
-                if self.pitch_axis.available:
+                if pitch_ok:
                     for dp in (-FINE_DELTA_P, +FINE_DELTA_P):
-                        trial = [list(x) for x in best_cand]
-                        trial[i][2] = float(np.clip(trial[i][2] + dp, -5.0, 5.0))
-                        trial_tup = [tuple(x) for x in trial]  # type: ignore[misc]
+                        trial = [
+                            (n, w, float(np.clip(p + dp if j == i else p, -5.0, 5.0)))
+                            for j, (n, w, p) in enumerate(best_cand)
+                        ]
                         prog(f"Optimise: fine pitch slot {i+1} {dp:+.1f}st → "
-                             f"{self._vmatch_fmt(trial_tup)}")
-                        d = score_emb(self._vmatch_build_embedding(trial_tup))
+                             f"{self._vmatch_fmt(trial)}")
+                        d = score(trial)
                         if d < best_dist:
-                            best_dist, best_cand = d, trial_tup
+                            best_dist, best_cand = d, trial
                             fine_improved = True
 
-        # ── Nelder-Mead continuous refinement (scipy, optional) ──────────────
-        # Hill-climbing + fine pass work on a discrete grid. Nelder-Mead refines
-        # continuously from the current best without any fixed step size.
-        # Capped at 50 synthesis calls so it doesn't run too long.
+        # ── Nelder-Mead continuous refinement (scipy, optional) ───────────────
+        # Embedding mode: 200 evals, fast.  Acoustic mode: 50 evals, slow.
         try:
             from scipy.optimize import minimize as _minimize
             nm_voices = [n for n, _, _ in best_cand]
             n_v = len(nm_voices)
             if n_v > 0:
-                x0 = np.array(
-                    [w for _, w, _ in best_cand] + [p for _, _, p in best_cand],
-                    dtype=np.float64,
-                )
+                if pitch_ok:
+                    x0 = np.array(
+                        [w for _, w, _ in best_cand] + [p for _, _, p in best_cand],
+                        dtype=np.float64,
+                    )
+                    def _nm_obj(params: np.ndarray) -> float:
+                        ws = np.clip(params[:n_v], 0.01, 1.0)
+                        ps = np.clip(params[n_v:], -5.0, 5.0)
+                        cand = _norm_cand([(nm_voices[i], float(ws[i]), float(ps[i])) for i in range(n_v)])
+                        return score(cand)
+                else:
+                    x0 = np.array([w for _, w, _ in best_cand], dtype=np.float64)
+                    def _nm_obj(params: np.ndarray) -> float:  # type: ignore[misc]
+                        ws = np.clip(params, 0.01, 1.0)
+                        cand = _norm_cand([(nm_voices[i], float(ws[i]), 0.0) for i in range(n_v)])
+                        return score(cand)
 
-                def _nm_obj(params: np.ndarray) -> float:
-                    ws = np.clip(params[:n_v], 0.01, 1.0)
-                    ps = np.clip(params[n_v:], -5.0, 5.0)
-                    cand = [(nm_voices[i], float(ws[i]), float(ps[i])) for i in range(n_v)]
-                    return score_emb(self._vmatch_build_embedding(cand))
-
+                max_fev = 200 if use_emb else 50
                 prog("Optimise: Nelder-Mead refinement…")
                 nm = _minimize(
                     _nm_obj, x0, method="Nelder-Mead",
-                    options={"maxfev": 50, "xatol": 0.002, "fatol": 0.001, "disp": False},
+                    options={"maxfev": max_fev, "xatol": 0.001, "fatol": 0.0005, "disp": False},
                 )
                 if nm.fun < best_dist:
-                    ws = np.clip(nm.x[:n_v], 0.01, 1.0)
-                    ws = ws / ws.sum()
-                    ps = np.clip(nm.x[n_v:], -5.0, 5.0)
-                    best_cand = [(nm_voices[i], float(ws[i]), float(ps[i])) for i in range(n_v)]
+                    if pitch_ok:
+                        ws = np.clip(nm.x[:n_v], 0.01, 1.0)
+                        ps = np.clip(nm.x[n_v:], -5.0, 5.0)
+                        best_cand = _norm_cand([(nm_voices[i], float(ws[i]), float(ps[i])) for i in range(n_v)])
+                    else:
+                        ws = np.clip(nm.x, 0.01, 1.0)
+                        best_cand = _norm_cand([(nm_voices[i], float(ws[i]), 0.0) for i in range(n_v)])
                     best_dist = float(nm.fun)
                     prog(f"Optimise: NM improved → {self._vmatch_fmt(best_cand)}  dist={best_dist:.3f}")
                 else:
@@ -3434,6 +3632,57 @@ class VoiceLabApp:
             pass  # scipy not installed — skip silently
         except Exception as _nm_exc:
             prog(f"Optimise: NM skipped ({_nm_exc})")
+
+        # ── X-vector re-rank (optional, toggleable) ───────────────────────────
+        # Synthesize each beam candidate + best_cand, extract speaker x-vector,
+        # cosine-rank against reference x-vector.  More accurate than embedding
+        # cosine — picks the best from the shortlist using speaker identity space.
+        if self._vmatch_xvrerank_var.get() and self._vmatch_load_speaker_model():
+            try:
+                prog("Optimise: x-vector re-ranking candidates…")
+                ref_xvec = self._vmatch_extract_xvector(y_ref, sr_ref)
+
+                # Collect unique candidates: beam members + current best
+                seen_sigs: set[str] = set()
+                rerank_pool: list[list[tuple[str, float, float]]] = []
+                for _, cand in beam:
+                    sig = "|".join(f"{n}:{w:.3f}:{p:.2f}" for n, w, p in cand)
+                    if sig not in seen_sigs:
+                        seen_sigs.add(sig)
+                        rerank_pool.append(cand)
+                bc_sig = "|".join(f"{n}:{w:.3f}:{p:.2f}" for n, w, p in best_cand)
+                if bc_sig not in seen_sigs:
+                    rerank_pool.append(best_cand)
+
+                xv_best_dist = 999.0
+                xv_best_cand = best_cand
+                bin_tmp = self.temp_dir / "_xvr.bin"
+                wav_tmp = self.temp_dir / "_xvr.wav"
+                for ri, cand in enumerate(rerank_pool):
+                    prog(f"Optimise: x-vec {ri+1}/{len(rerank_pool)}: {self._vmatch_fmt(cand)}")
+                    try:
+                        emb = self._vmatch_build_embedding(cand)
+                        if emb is None:
+                            continue
+                        VoiceLibrary.save_bin(emb, bin_tmp)
+                        self._do_synthesize(bin_tmp, synth_text, wav_tmp, speed=opt_speed)
+                        y_s, sr_s = librosa.load(str(wav_tmp), sr=16000, mono=True)
+                        xvec = self._vmatch_extract_xvector(y_s, sr_s)
+                        xv_d = _cosine_dist(ref_xvec, xvec)
+                        if xv_d < xv_best_dist:
+                            xv_best_dist = xv_d
+                            xv_best_cand = cand
+                    except Exception:
+                        continue
+                for _p in (bin_tmp, wav_tmp):
+                    try:
+                        _p.unlink()
+                    except OSError:
+                        pass
+                best_cand = xv_best_cand
+                prog(f"Optimise: x-vec winner → {self._vmatch_fmt(best_cand)}  xv_dist={xv_best_dist:.3f}")
+            except Exception as _xv_exc:
+                prog(f"Optimise: x-vec re-rank skipped ({_xv_exc})")
 
         # Store result
         self._vmatch_opt_emb   = self._vmatch_build_embedding(best_cand)
@@ -3465,6 +3714,7 @@ class VoiceLabApp:
             # Populate Fine Tune panel from optimiser result
             self._vmatch_tune_from_cand(self._vmatch_opt_cand)
             self._vmatch_speed_slider_var.set(opt_speed)
+            self._vmatch_refresh_button_states()
         self.root.after(0, finish)
 
     def vmatch_optimise(self) -> None:
@@ -3473,7 +3723,7 @@ class VoiceLabApp:
             self.status_var.set("Select a reference audio file first.")
             return
         if not self._vmatch_scores:
-            self.status_var.set("Run Find Match first to seed the optimiser.")
+            self.status_var.set("Run Find Best Voice first to seed the optimiser.")
             return
         if not self._require_voices() or not self._can_synthesize():
             messagebox.showerror(APP_TITLE, "Start the server first.")
@@ -3487,7 +3737,7 @@ class VoiceLabApp:
 
     def vmatch_load_opt_to_mixer(self) -> None:
         if not self._vmatch_opt_cand:
-            self.status_var.set("Run Optimise Blend first.")
+            self.status_var.set("Run Build Best Blend first.")
             return
         active = [(n, w, p) for n, w, p in self._vmatch_opt_cand if w > 0.02]
         ws = np.array([w for _, w, _ in active], dtype=np.float32)
@@ -3499,10 +3749,13 @@ class VoiceLabApp:
                 self.voice_vars[i].set(name)
                 self.weight_vars[i].set(round(float(ws[i]), 1))
                 self.pitch_vars[i].set(round(pitch_st, 2))
+                self.speed_vars[i].set(1.0)
             else:
                 self.active_vars[i].set(False)
+                self.voice_vars[i].set("")
                 self.weight_vars[i].set(0.0)
                 self.pitch_vars[i].set(0.0)
+                self.speed_vars[i].set(1.0)
         if self.pitch_axis.available:
             self.bake_pitch_var.set(True)
         self.status_var.set(
@@ -3511,7 +3764,7 @@ class VoiceLabApp:
 
     def vmatch_export_optimised(self) -> None:
         if self._vmatch_opt_emb is None:
-            self.status_var.set("Run Optimise Blend first.")
+            self.status_var.set("Run Build Best Blend first.")
             return
         out = self._default_export_path()
         arr = self._vmatch_opt_emb

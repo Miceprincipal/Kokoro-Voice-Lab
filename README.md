@@ -24,13 +24,14 @@ A GUI tool for rating, blending, and approximating voices from the [Kokoro-82M](
 
 **Voice list auto-refresh** — After exporting a `.bin`, the voice dropdowns automatically rescan the voices folder. Newly exported voices are immediately available in all slots without restarting.
 
-**Voice Match tab** — Drop in any WAV or MP3 of a real voice and approximate it from the Kokoro voice pool. Full pipeline:
+**Voice Match tab** — Drop in any WAV or MP3 of a real voice and approximate it from the Kokoro voice pool. Two setup steps, then match:
 
-1. **Build Fingerprints** — synthesises a coverage sentence for every voice, extracts an 86-dim audio feature vector and a 256-dim canonical embedding, trains a Ridge regressor (audio → embedding space), and saves everything to `voice_match_mfcc.json`. Only needs to run once, or after adding new voices.
-2. **Find Match** — measures reference F0, gates the pool to same-pitch voices, ranks by embedding-space cosine distance (preferred) or audio-space cosine distance, then synthesises the top 12 saying your transcript and re-ranks by audio cosine distance. Eliminates content-mismatch contamination from the coverage sentence.
-3. **Optimise Blend** — seeds 5 starting candidates (singles and blends of top pool voices), hill-climbs weights and pitch against synthesised audio using cosine distance, runs a fine pass (±5% weights, ±0.5st pitch), then Nelder-Mead continuous refinement (scipy, optional). Result scored: excellent / good / fair / rough.
-4. **Fine Tune** — the optimiser result auto-loads here. Three slots with voice dropdown, weight slider (normalised contribution %), and pitch slider (±5st). Speed slider (0.5–2.0×) for pacing control. Per-slot preview and full blend preview. Export directly or send to the Mixer.
-5. **Blend Explorer** — each round injects 3 pool voices (18% each) into your current blend and offers them as A / B / C choices. Play each (synthesised saying your transcript), pick the closest — Fine Tune updates and the next round tests 3 more voices. Export button included.
+- **Build Fingerprints** (required, once) — synthesises a coverage sentence for every voice, extracts acoustic features and a 256-dim canonical embedding per voice, trains a Ridge regressor (audio → embedding space), saves to `voice_match_mfcc.json`. Rebuild after adding new voices.
+- **Get Speaker Model** (optional, ~26 MB) — downloads `voxceleb_resnet34.onnx`, a speaker encoder trained on real speech. Enables Speaker match mode for better human-voice identity matching. Rebuild fingerprints after downloading to generate speaker x-vectors.
+- **Find Best Voice** — measures reference F0, gates the pool to same-pitch voices, then ranks by the best available method: **Speaker match** (ResNet34 x-vector cosine) → **Fast match** (Ridge regressor → embedding-space cosine) → **Legacy** (MFCC L2). Synthesises the top 12 saying your transcript and re-ranks. The "Active matcher" row shows which method ran and result tags show `[spkr]`/`[emb]`/`[aud]`/`[lgcy]`.
+- **Build Best Blend** — seeds 5 starting candidates, hill-climbs weights and pitch, fine pass (±5% weights, ±0.5st pitch), Nelder-Mead continuous refinement (scipy, optional). Result scored: excellent / good / fair / rough.
+- **Fine Tune** — three voice slots with weight and pitch sliders, full blend preview, export or send to Mixer.
+- **Blend Explorer** — each round offers three blend variants (A / B / C). Pick the closest, Fine Tune updates, repeat to converge.
 
 Requires `librosa` for fingerprints and matching. Transcription requires `faster-whisper` or `openai-whisper`.
 
@@ -79,6 +80,10 @@ pip install onnxruntime-gpu misaki[en] soundfile numpy pillow scikit-learn libro
 
 `scikit-learn` is required for the Bake slot pitch feature (Ridge regression to build the pitch direction vector). If not installed, the checkbox is disabled and a status message explains why.
 
+`scipy` is optional — used by Voice Match's Nelder-Mead refinement pass. Without it the hill-climb and fine pass still run; Nelder-Mead is simply skipped.
+
+`voxceleb_resnet34.onnx` (~26 MB) is the optional speaker model for Voice Match. Download it via the **Get Speaker Model** button in the Voice Match tab — no extra pip packages needed, it runs on the existing `onnxruntime` install.
+
 `librosa` is required for Voice Match (MFCC fingerprinting, F0 measurement, acoustic analysis). Also needed for `extend_voice_analysis.py`.
 
 ### 3. Run
@@ -103,7 +108,7 @@ The tool auto-detects the `voices/` folder and working directory on first launch
 
 5. **Use Trait Match** — Set target trait sliders in the Mixer tab → **Suggest 3 Voices**. Loads the best matches into the slots.
 
-6. **Match a real voice** — Voice Match tab. Browse to a WAV or MP3, transcribe or paste the text, **Build Fingerprints** (once), **Find Match**, **Optimise Blend**. Use Fine Tune and Blend Explorer to converge by ear.
+6. **Match a real voice** — Voice Match tab. Browse to a WAV or MP3, transcribe or paste the text. Setup: **Build Fingerprints** (once) and optionally **Get Speaker Model** (~26 MB, better identity matching). Then **Find Best Voice**, **Build Best Blend**. Use Fine Tune and Blend Explorer to converge by ear.
 
 ---
 
@@ -111,29 +116,41 @@ The tool auto-detects the `voices/` folder and working directory on first launch
 
 ### Architecture overview
 
-The matching pipeline operates in Kokoro's embedding space rather than raw audio feature space. MFCC similarity in audio space doesn't correlate reliably with Kokoro identity similarity — one voice can produce similar MFCCs for different texts, and different voices can produce similar MFCCs for the same text. The solution: predict where the reference sits in Kokoro's 256-dim voice embedding space and compare directly.
+The matching pipeline has two tiers. The preferred tier operates in speaker identity space; the fallback tier operates in Kokoro's embedding space.
 
+**Speaker match (Mode S)** — requires the optional ~26 MB speaker model:
+```
+Reference audio (human)
+  → ResNet34 ONNX (wespeaker, trained on VoxCeleb2)
+  → 256-dim L2-normalised x-vector
+  → cosine distance to pre-computed x-vectors for each Kokoro voice
+  → top 12 → synthesis re-rank → result
+```
+
+**Fast match (Mode A)** — built-in, no extra download:
 ```
 Reference audio
   → 86-dim features (MFCC + Δ + ΔΔ + log-mel + spectral contrast)
-  → Ridge regressor (trained on voice corpus)
+  → Ridge regressor (trained on voice corpus during fingerprint build)
   → predicted 256-dim Kokoro embedding
   → cosine distance to each voice's canonical embedding
   → top 12 → synthesis re-rank → result
 ```
 
-Each voice `.bin` has a **canonical embedding**: the mean of all its rows, giving a stable single identity vector used for matching.
+Each voice `.bin` has a **canonical embedding**: the mean of all its rows, giving a stable single identity vector. The **Ridge regressor** learns the mapping from acoustic features to Kokoro embedding space using synthesised audio from all voices.
 
-### Find Match pipeline
+### Find Best Voice pipeline
 
 1. Loads reference audio, trims silence, extracts the best 8-second window by RMS energy. Peak-normalises before analysis.
 2. Measures reference F0 with `librosa.pyin`. Filters the voice pool to voices within ±40% of that F0 — prevents cross-gender matches.
-3. **Mode A (preferred)** — extracts 86-dim features from the reference, multiplies by the Ridge regressor to predict a Kokoro embedding, ranks all voices by cosine distance to their canonical embeddings. No synthesis needed for the coarse pass.
-4. **Mode B (fallback)** — if the regressor is absent, z-normalises features across the population and ranks by cosine distance in feature space.
-5. **Mode C (legacy)** — if fingerprints are pre-v2, falls back to weighted MFCC L2 distance with a rebuild prompt.
-6. Takes the top 12, synthesises each saying the transcript, re-ranks by audio cosine distance. Eliminates content-mismatch contamination from the coverage sentence.
+3. Runs the best available coarse ranking method (shown in Active matcher row):
+   - **Speaker match** — ResNet34 x-vector cosine. Best for human reference audio.
+   - **Fast match (embedding)** — Ridge regressor → Kokoro embedding cosine. Falls back if speaker model absent.
+   - **Fast match (audio)** — z-normalised feature cosine. Falls back if regressor absent.
+   - **Legacy** — weighted MFCC L2. Falls back for pre-v2 fingerprints; rebuild recommended.
+4. Takes the top 12, synthesises each saying the transcript, re-ranks using the same method. Eliminates content-mismatch contamination from the coverage sentence.
 
-For reference audio longer than 20 seconds, the pipeline averages feature measurements across three windows (start, middle, end).
+For reference audio longer than 20 seconds, the pipeline averages measurements across three windows (start, middle, end).
 
 ### Optimise Blend
 

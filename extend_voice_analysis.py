@@ -21,9 +21,8 @@ import soundfile as sf
 
 # ── paths ────────────────────────────────────────────────────────────────────
 APP_DIR       = Path(__file__).resolve().parent
-ROOT          = APP_DIR.parent.parent          # s:/Screenreader
 VOICES_DIR    = APP_DIR / "voices"
-AUDITION_DIR  = ROOT / "cache" / "voice-audition"
+AUDITION_DIR  = APP_DIR / "cache" / "voice-audition"
 CSV_PATH      = AUDITION_DIR / "voice-analysis.csv"
 TEMP_WAV      = AUDITION_DIR / "_extend_tmp.wav"
 
