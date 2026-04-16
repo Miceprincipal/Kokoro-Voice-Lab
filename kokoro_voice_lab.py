@@ -33,7 +33,13 @@ DEFAULT_CONFIG_PATH = APP_DIR / "voice_lab_config.json"
 DEFAULT_RATINGS_PATH = APP_DIR / "voice_ratings.json"
 DEFAULT_EXPORT_DIR = APP_DIR / "exports"
 DEFAULT_ANALYSIS_CSV_PATH = APP_DIR.parent.parent / "cache" / "voice-audition" / "voice-analysis.csv"
-VOICE_MATCH_MFCC_PATH = APP_DIR / "voice_match_mfcc.json"
+VOICE_MATCH_MFCC_PATH     = APP_DIR / "voice_match_mfcc.json"
+VOICE_MATCH_SPEAKER_PATH  = APP_DIR / "voice_match_speaker.json"
+VOICE_MATCH_SPEAKER_MODEL = APP_DIR / "voxceleb_resnet34.onnx"
+_SPEAKER_MODEL_URL = (
+    "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34"
+    "/resolve/main/voxceleb_resnet34.onnx"
+)
 VOICE_MATCH_COVERAGE = (
     "When the sunlight strikes raindrops in the air, they act as a prism and form a rainbow. "
     "She sells seashells by the seashore. "
@@ -506,6 +512,11 @@ class VoiceLabApp:
         self._vmatch_progress_var = tk.StringVar(value="")
         self._vmatch_ref_var      = tk.StringVar(value="")
         self._vmatch_mfcc_db: dict[str, dict] = {}
+        self._vmatch_canonical: dict[str, np.ndarray] = {}   # voice → 256-dim mean embedding
+        self._vmatch_regressor: np.ndarray | None = None     # (86, 256) audio-features → emb
+        self._vmatch_xvectors: dict[str, np.ndarray] = {}   # voice → 256-dim speaker x-vector
+        self._vmatch_speaker_session = None                   # onnxruntime session (ResNet34)
+        self._vmatch_speaker_var = tk.StringVar(value="No model")
         self._vmatch_scores: list[tuple[float, str]] = []
         self._vmatch_results_listbox: tk.Listbox | None = None
         self._vmatch_transcript_widget: tk.Text | None = None
@@ -1274,12 +1285,21 @@ class VoiceLabApp:
         sl.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
         self._vmatch_status_label = sl
 
+        ttk.Label(mod, text="Speaker model:").grid(row=2, column=0, sticky="w", pady=(2, 0))
+        ttk.Label(mod, textvariable=self._vmatch_speaker_var,
+                  foreground="#555", font=("Segoe UI", 8)).grid(
+                      row=2, column=1, sticky="w", padx=(8, 0), pady=(2, 0))
+
         btn_row = ttk.Frame(mod)
-        btn_row.grid(row=0, column=2, rowspan=2, sticky="e", padx=(12, 0))
+        btn_row.grid(row=0, column=2, rowspan=3, sticky="ne", padx=(12, 0))
         ttk.Button(btn_row, text="Build Fingerprints",
-                   command=self.vmatch_build).pack(side="left")
+                   command=self.vmatch_build).pack(side="top", fill="x")
+        ttk.Button(btn_row, text="Get Speaker Model (~26 MB)",
+                   command=self.vmatch_download_speaker_model).pack(
+                       side="top", fill="x", pady=(4, 0))
         ttk.Label(btn_row, textvariable=self._vmatch_progress_var,
-                  foreground="#666", font=("Segoe UI", 8)).pack(side="left", padx=(8, 0))
+                  foreground="#666", font=("Segoe UI", 8)).pack(
+                      side="top", anchor="w", pady=(4, 0))
 
         # ── Two-column body ───────────────────────────────────────────────────
         body = ttk.Frame(parent)
@@ -1525,12 +1545,54 @@ class VoiceLabApp:
             return
         try:
             data = json.loads(VOICE_MATCH_MFCC_PATH.read_text(encoding="utf-8"))
+            fmt = data.get("format", 1)
             self._vmatch_mfcc_db = data.get("voices", {})
-            valid = sum(1 for v in self._vmatch_mfcc_db.values() if "mean" in v)
-            total = len(self._vmatch_mfcc_db)
-            self._vmatch_set_status(f"Ready — {valid}/{total} voices fingerprinted")
+            if fmt >= 2:
+                self._vmatch_canonical = {
+                    name: np.array(fp["canonical_emb"], dtype=np.float32)
+                    for name, fp in self._vmatch_mfcc_db.items()
+                    if "canonical_emb" in fp
+                }
+                reg = data.get("regressor")
+                self._vmatch_regressor = np.array(reg, dtype=np.float32) if reg else None
+                valid = sum(1 for v in self._vmatch_mfcc_db.values() if "features" in v)
+                total = len(self._vmatch_mfcc_db)
+                reg_note = "regressor ✓" if self._vmatch_regressor is not None else "regressor ✗ — rebuild"
+                self._vmatch_set_status(
+                    f"Ready — {valid}/{total} voices fingerprinted  [{len(self._vmatch_canonical)} emb, {reg_note}]")
+            else:
+                self._vmatch_canonical = {}
+                self._vmatch_regressor = None
+                valid = sum(1 for v in self._vmatch_mfcc_db.values() if "mean" in v)
+                total = len(self._vmatch_mfcc_db)
+                self._vmatch_set_status(
+                    f"Legacy fingerprints — {valid}/{total} voices (rebuild for embedding-space matching)")
         except Exception as exc:
             self._vmatch_set_status(f"Could not load: {exc}", error=True)
+
+        # ── Speaker x-vector DB (optional, built alongside fingerprints) ──────
+        self._vmatch_xvectors = {}
+        if VOICE_MATCH_SPEAKER_PATH.exists():
+            try:
+                sp = json.loads(VOICE_MATCH_SPEAKER_PATH.read_text(encoding="utf-8"))
+                self._vmatch_xvectors = {
+                    name: np.array(xv, dtype=np.float32)
+                    for name, xv in sp.get("voices", {}).items()
+                }
+            except Exception:
+                self._vmatch_xvectors = {}
+
+        # Update speaker model status var
+        if self._vmatch_xvectors and VOICE_MATCH_SPEAKER_MODEL.exists():
+            self._vmatch_speaker_var.set(
+                f"✓ Ready  ({len(self._vmatch_xvectors)} voices)")
+        elif self._vmatch_xvectors:
+            self._vmatch_speaker_var.set(
+                f"{len(self._vmatch_xvectors)} xvec (model missing — redownload)")
+        elif VOICE_MATCH_SPEAKER_MODEL.exists():
+            self._vmatch_speaker_var.set("Model present — rebuild fingerprints")
+        else:
+            self._vmatch_speaker_var.set("No model")
 
     def _vmatch_set_status(self, msg: str, error: bool = False) -> None:
         """Update the fingerprint status label — red+large on error, normal otherwise."""
@@ -1542,6 +1604,43 @@ class VoiceLabApp:
             else:
                 self._vmatch_status_label.config(
                     foreground="#555", font=("Segoe UI", 9))
+
+    def _vmatch_load_speaker_model(self) -> bool:
+        """Lazy-load the ResNet34 ONNX speaker model. Returns True if available."""
+        if self._vmatch_speaker_session is not None:
+            return True
+        if not VOICE_MATCH_SPEAKER_MODEL.exists():
+            return False
+        try:
+            from onnxruntime import InferenceSession
+            self._vmatch_speaker_session = InferenceSession(
+                str(VOICE_MATCH_SPEAKER_MODEL),
+                providers=["CPUExecutionProvider"],
+            )
+            return True
+        except Exception:
+            self._vmatch_speaker_session = None
+            return False
+
+    def _vmatch_extract_xvector(self, y: np.ndarray, sr: int) -> np.ndarray:
+        """Extract a 256-dim L2-normalised speaker x-vector via ResNet34 ONNX.
+
+        Preprocessing matches wespeaker's kaldi-style log-mel filterbank:
+        80 mel bins, 25 ms window, 10 ms hop, per-utterance mean normalisation.
+        """
+        import librosa
+        y16 = librosa.resample(y, orig_sr=sr, target_sr=16000) if sr != 16000 else y
+        mel = librosa.feature.melspectrogram(
+            y=y16, sr=16000, n_fft=512, hop_length=160, win_length=400,
+            n_mels=80, fmin=20.0, fmax=8000.0, window="hamming", power=2.0,
+        )
+        log_mel = np.log(mel.clip(min=1e-10)).T              # [T, 80]
+        log_mel -= log_mel.mean(axis=0, keepdims=True)        # utterance CMVN
+        feats = log_mel[np.newaxis].astype(np.float32)        # [1, T, 80]
+        out = self._vmatch_speaker_session.run(None, {"feats": feats})[0]  # [1, 256]
+        emb = out[0].astype(np.float32)
+        norm = np.linalg.norm(emb)
+        return emb / norm if norm > 1e-8 else emb
 
     def _vmatch_build_worker(self) -> None:
         """Background: synthesise coverage sentence for all voices, extract MFCCs, save JSON."""
@@ -1570,30 +1669,103 @@ class VoiceLabApp:
         tmp = self.temp_dir / "_vmatch_cov.wav"
         fail_count = 0
 
+        def _extract_features(y: np.ndarray, sr: int) -> np.ndarray:
+            """86-dim: MFCC(13) + Δ(13) + ΔΔ(13) + log-mel(40) + contrast(7)."""
+            mfcc     = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+            delta    = librosa.feature.delta(mfcc)
+            delta2   = librosa.feature.delta(mfcc, order=2)
+            mel      = np.log(librosa.feature.melspectrogram(y=y, sr=sr, n_mels=40) + 1e-6)
+            contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+            return np.concatenate([
+                mfcc.mean(axis=1),      # 13
+                delta.mean(axis=1),     # 13
+                delta2.mean(axis=1),    # 13
+                mel.mean(axis=1),       # 40
+                contrast.mean(axis=1),  # 7
+            ]).astype(np.float32)       # total: 86
+
+        def _canonical_emb(bin_path: Path) -> np.ndarray:
+            """256-dim identity: mean of all embedding rows in the .bin."""
+            raw = np.fromfile(bin_path, dtype=np.float32)
+            frames = raw.reshape(-1, 256)
+            return frames.mean(axis=0).astype(np.float32)
+
+        _speaker_ready = self._vmatch_load_speaker_model()
+
         try:
+            feat_rows:  list[np.ndarray] = []
+            emb_rows:   list[np.ndarray] = []
+            xvec_db:    dict[str, list]  = {}   # name → 256-dim x-vector (if model present)
+
             for i, v in enumerate(voices, 1):
                 prog_msg = f"Fingerprinting {i}/{total}: {v.name}"
                 _prog(prog_msg)
                 _status(prog_msg)
                 try:
+                    canonical = _canonical_emb(v.path)
                     self._do_synthesize(v.path, VOICE_MATCH_COVERAGE, tmp)
                     y, sr = librosa.load(str(tmp), sr=22050, mono=True)
-                    mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+                    feats = _extract_features(y, sr)
                     db[v.name] = {
-                        "mean": mfcc.mean(axis=1).tolist(),
-                        "std":  mfcc.std(axis=1).tolist(),
+                        "features":      feats.tolist(),
+                        "canonical_emb": canonical.tolist(),
                     }
+                    feat_rows.append(feats)
+                    emb_rows.append(canonical)
+                    # ── Speaker x-vector (Mode S) — only when model is loaded ──
+                    if _speaker_ready:
+                        try:
+                            xvec = self._vmatch_extract_xvector(y, sr)
+                            xvec_db[v.name] = xvec.tolist()
+                        except Exception:
+                            pass
                 except Exception as exc:
                     db[v.name] = {"error": str(exc)}
                     fail_count += 1
 
-            valid = sum(1 for fp in db.values() if "mean" in fp)
+            # ── Train Ridge regressor: audio features → canonical embedding ───
+            regressor_list: list | None = None
+            if len(feat_rows) >= 4:
+                _prog("Building regressor…")
+                X = np.stack(feat_rows)   # (N, 86)
+                Y = np.stack(emb_rows)    # (N, 256)
+                alpha = 1.0
+                W = np.linalg.solve(X.T @ X + alpha * np.eye(X.shape[1]), X.T @ Y)
+                regressor_list = W.tolist()
+
+            valid = sum(1 for fp in db.values() if "features" in fp)
             VOICE_MATCH_MFCC_PATH.write_text(json.dumps({
+                "format": 2,
                 "coverage_sentence": VOICE_MATCH_COVERAGE,
+                "regressor": regressor_list,
                 "voices": db,
             }, indent=2), encoding="utf-8")
             self._vmatch_mfcc_db = db
+            self._vmatch_canonical = {
+                name: np.array(fp["canonical_emb"], dtype=np.float32)
+                for name, fp in db.items() if "canonical_emb" in fp
+            }
+            self._vmatch_regressor = (
+                np.array(regressor_list, dtype=np.float32) if regressor_list else None
+            )
+
+            # ── Save speaker x-vectors to separate file ───────────────────────
+            if xvec_db:
+                VOICE_MATCH_SPEAKER_PATH.write_text(
+                    json.dumps({"voices": xvec_db}, indent=2), encoding="utf-8")
+                self._vmatch_xvectors = {
+                    name: np.array(xv, dtype=np.float32) for name, xv in xvec_db.items()
+                }
+                spk_note = f"  [speaker: {len(xvec_db)} xvec ✓]"
+                self.root.after(0, lambda: self._vmatch_speaker_var.set(
+                    f"✓ Ready  ({len(xvec_db)} voices)"))
+            else:
+                spk_note = ""
+
             msg = f"Ready — {valid}/{total} voices fingerprinted"
+            if regressor_list:
+                msg += "  [regressor ✓]"
+            msg += spk_note
             if fail_count:
                 msg += f"  ({fail_count} failed — check server is running)"
             _status(msg)
@@ -1612,6 +1784,45 @@ class VoiceLabApp:
         self._vmatch_status_var.set("Building…")
         self._vmatch_progress_var.set("")
         threading.Thread(target=self._vmatch_build_worker, daemon=True).start()
+
+    def vmatch_download_speaker_model(self) -> None:
+        """Download the wespeaker ResNet34 ONNX (~26 MB) to the app directory."""
+        if VOICE_MATCH_SPEAKER_MODEL.exists():
+            messagebox.showinfo(APP_TITLE, "Speaker model already downloaded.")
+            return
+
+        def worker() -> None:
+            import urllib.request
+            tmp = VOICE_MATCH_SPEAKER_MODEL.with_suffix(".tmp")
+            try:
+                self.root.after(0, lambda: self._vmatch_progress_var.set(
+                    "Downloading speaker model (~26 MB)…"))
+                self.root.after(0, lambda: self._vmatch_speaker_var.set("Downloading…"))
+
+                def reporthook(count: int, block: int, total: int) -> None:
+                    if total > 0:
+                        pct = min(100, int(count * block * 100 / total))
+                        self.root.after(0, lambda p=pct:
+                            self._vmatch_progress_var.set(
+                                f"Downloading speaker model… {p}%"))
+
+                urllib.request.urlretrieve(_SPEAKER_MODEL_URL, str(tmp), reporthook)
+                tmp.rename(VOICE_MATCH_SPEAKER_MODEL)
+                # Lazy-load so it's ready immediately
+                self._vmatch_speaker_session = None
+                self._vmatch_load_speaker_model()
+                self.root.after(0, lambda: self._vmatch_speaker_var.set("✓ Ready"))
+                self.root.after(0, lambda: self._vmatch_progress_var.set(
+                    "Speaker model ready — rebuild fingerprints to enable Mode S"))
+            except Exception as exc:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+                err = str(exc)
+                self.root.after(0, lambda e=err: self._vmatch_progress_var.set(
+                    f"Download failed: {e}"))
+                self.root.after(0, lambda: self._vmatch_speaker_var.set("Download failed"))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     @staticmethod
     def _vmatch_transcript_path(audio_path: str) -> Path:
@@ -1847,58 +2058,157 @@ class VoiceLabApp:
             note += f"  |  ref F0 ≈ {f0_label}"
             self.root.after(0, lambda: self.status_var.set(f"Analysing… ({note})"))
 
-            # ── Step 2: MFCC screen with F0 gating ───────────────────────────
-            # Weight lower MFCC coefficients more — they carry timbre/formant info;
-            # higher ones are more content-dependent.
-            mfcc_weights = np.array(
-                [2.0, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2,
-                 1.5, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1],
-                dtype=np.float32,
-            )  # 26 = 13 mean + 13 std
+            # ── Local helpers ─────────────────────────────────────────────────
+            def _extract_feats(windows: list) -> np.ndarray:
+                """86-dim feature vector averaged over windows."""
+                vecs = []
+                for w in windows:
+                    mfcc     = librosa.feature.mfcc(y=w, sr=sr, n_mfcc=13)
+                    delta    = librosa.feature.delta(mfcc)
+                    delta2   = librosa.feature.delta(mfcc, order=2)
+                    mel      = np.log(librosa.feature.melspectrogram(y=w, sr=sr, n_mels=40) + 1e-6)
+                    contrast = librosa.feature.spectral_contrast(y=w, sr=sr)
+                    vecs.append(np.concatenate([
+                        mfcc.mean(axis=1), delta.mean(axis=1), delta2.mean(axis=1),
+                        mel.mean(axis=1),  contrast.mean(axis=1),
+                    ]))
+                return np.mean(vecs, axis=0).astype(np.float32)
 
-            vecs = []
-            for w in all_windows:
-                m = librosa.feature.mfcc(y=w, sr=sr, n_mfcc=13)
-                vecs.append(np.concatenate([m.mean(axis=1), m.std(axis=1)]))
-            ref_vec = np.mean(vecs, axis=0) * mfcc_weights
+            def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
+                na, nb = np.linalg.norm(a), np.linalg.norm(b)
+                if na < 1e-8 or nb < 1e-8:
+                    return 1.0
+                return float(1.0 - np.dot(a, b) / (na * nb))
 
             def f0_ok(voice_f0_str: str) -> bool:
-                """Allow voices whose F0 is within 40% of reference F0."""
                 if ref_f0 <= 0:
-                    return True  # no reference F0 — no gating
+                    return True
                 try:
                     vf0 = float(voice_f0_str)
                 except (ValueError, TypeError):
-                    return True  # no voice F0 data — let it through
+                    return True
                 if vf0 <= 0:
                     return True
-                ratio = abs(ref_f0 - vf0) / ref_f0
-                return ratio < 0.40
+                return abs(ref_f0 - vf0) / ref_f0 < 0.40
 
+            # ── Step 2: coarse ranking ────────────────────────────────────────
             passed, gated_out = 0, 0
             coarse: list[tuple[float, str]] = []
-            for name, fp in self._vmatch_mfcc_db.items():
-                if "mean" not in fp:
-                    continue
-                # F0 gate using acoustic CSV data loaded into self._acoustic
-                acoustic_row = self._acoustic.get(name, {})
-                if not f0_ok(acoustic_row.get("f0_hz", "")):
-                    gated_out += 1
-                    continue
-                fp_vec = np.concatenate([np.array(fp["mean"]), np.array(fp["std"])]) * mfcc_weights
-                dist = float(np.linalg.norm(ref_vec - fp_vec))
-                coarse.append((dist, name))
-                passed += 1
-            coarse.sort()
+            mode_note = ""
+            _fmt2 = any("features" in fp for fp in self._vmatch_mfcc_db.values())
 
+            # State for re-rank — set per mode
+            ref_feats: np.ndarray | None = None
+            pop_mean:  np.ndarray | None = None
+            pop_std:   np.ndarray | None = None
+            ref_norm:  np.ndarray | None = None
+            ref_xvec:  np.ndarray | None = None
+            _rerank_emb = False  # True → Mode A: raw cosine in feature space
+            _mode_s     = False  # True → Mode S: speaker encoder x-vector
+
+            if self._vmatch_xvectors and self._vmatch_load_speaker_model():
+                # ── Mode S: speaker-encoder (ResNet34 ONNX) ───────────────────
+                # human reference → 256-dim x-vector → cosine to gallery x-vectors
+                # Gallery was built from synthesised Kokoro audio — same encoder,
+                # so human↔synthetic comparison is in a consistent embedding space.
+                try:
+                    self.root.after(0, lambda: self.status_var.set(
+                        "Extracting speaker embedding (Mode S)…"))
+                    ref_xvec = self._vmatch_extract_xvector(y, sr)
+                    mode_note = "  [speaker-encoder]"
+                    _mode_s = True
+                    for name, xvec in self._vmatch_xvectors.items():
+                        acoustic_row = self._acoustic.get(name, {})
+                        if not f0_ok(acoustic_row.get("f0_hz", "")):
+                            gated_out += 1
+                            continue
+                        coarse.append((_cosine_dist(ref_xvec, xvec), name))
+                        passed += 1
+                except Exception:
+                    _mode_s = False  # fall through to Mode A below
+
+            if not _mode_s and _fmt2 and self._vmatch_regressor is not None and self._vmatch_canonical:
+                # ── Mode A: embedding-space (preferred) ───────────────────────
+                # audio → 86-dim → regressor → predicted 256-dim embedding
+                # → cosine distance to each voice's canonical embedding
+                self.root.after(0, lambda: self.status_var.set("Extracting reference features…"))
+                ref_feats = _extract_feats(all_windows)
+                pred_emb  = (ref_feats @ self._vmatch_regressor).astype(np.float32)
+                mode_note = "  [embedding-space]"
+                _rerank_emb = True
+                for name, can_emb in self._vmatch_canonical.items():
+                    acoustic_row = self._acoustic.get(name, {})
+                    if not f0_ok(acoustic_row.get("f0_hz", "")):
+                        gated_out += 1
+                        continue
+                    coarse.append((_cosine_dist(pred_emb, can_emb), name))
+                    passed += 1
+
+            elif not _mode_s and _fmt2:
+                # ── Mode B: new features, regressor absent ────────────────────
+                self.root.after(0, lambda: self.status_var.set("Extracting reference features…"))
+                ref_feats = _extract_feats(all_windows)
+                fp_raw = {
+                    name: np.array(fp["features"], dtype=np.float32)
+                    for name, fp in self._vmatch_mfcc_db.items() if "features" in fp
+                }
+                if not fp_raw:
+                    self.root.after(0, lambda: self.status_var.set(
+                        "No valid fingerprints — rebuild fingerprints first."))
+                    return
+                pop_mat  = np.stack(list(fp_raw.values()))
+                pop_mean = pop_mat.mean(axis=0)
+                pop_std  = pop_mat.std(axis=0) + 1e-8
+                ref_norm = (ref_feats - pop_mean) / pop_std
+                fp_norm  = {n: (v - pop_mean) / pop_std for n, v in fp_raw.items()}
+                mode_note = "  [audio-space, rebuild for embedding match]"
+                for name, vec in fp_norm.items():
+                    acoustic_row = self._acoustic.get(name, {})
+                    if not f0_ok(acoustic_row.get("f0_hz", "")):
+                        gated_out += 1
+                        continue
+                    coarse.append((_cosine_dist(ref_norm, vec), name))
+                    passed += 1
+
+            elif not _mode_s:
+                # ── Mode C: legacy fingerprints (MFCC mean+std, L2) ───────────
+                self.root.after(0, lambda: self.status_var.set(
+                    "Legacy fingerprints — rebuild for embedding-space matching"))
+                mfcc_weights = np.array(
+                    [2.0, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2,
+                     1.5, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1],
+                    dtype=np.float32,
+                )
+                vecs = []
+                for w in all_windows:
+                    m = librosa.feature.mfcc(y=w, sr=sr, n_mfcc=13)
+                    vecs.append(np.concatenate([m.mean(axis=1), m.std(axis=1)]))
+                ref_vec_legacy = np.mean(vecs, axis=0) * mfcc_weights
+                mode_note = "  [legacy MFCC — rebuild recommended]"
+                for name, fp in self._vmatch_mfcc_db.items():
+                    if "mean" not in fp:
+                        continue
+                    acoustic_row = self._acoustic.get(name, {})
+                    if not f0_ok(acoustic_row.get("f0_hz", "")):
+                        gated_out += 1
+                        continue
+                    fp_vec = (np.concatenate([np.array(fp["mean"]), np.array(fp["std"])])
+                              * mfcc_weights)
+                    coarse.append((float(np.linalg.norm(ref_vec_legacy - fp_vec)), name))
+                    passed += 1
+
+            coarse.sort()
             gate_note = (f"F0 gate: {passed} voices in range"
-                         f"{f', {gated_out} excluded' if gated_out else ''}")
+                         f"{f', {gated_out} excluded' if gated_out else ''}"
+                         f"{mode_note}")
             self.root.after(0, lambda: self.status_var.set(gate_note))
 
             # ── Step 3: content-matched re-rank on top 12 ────────────────────
-            # Synthesise each top candidate saying the transcript (or coverage
-            # sentence), compare against the reference MFCC with same content.
-            # This eliminates the content-mismatch contamination in the coarse step.
+            # Synthesise each top candidate saying the transcript, extract the
+            # same 86-dim features, compare to reference with cosine distance.
+            # Mode A: raw cosine (scale-invariant, no z-norm needed).
+            # Mode B: z-norm with population stats.
+            # Mode C: falls back to cosine of raw features.
             reranked = list(coarse)
             transcript = self._vmatch_match_text()
             if self._can_synthesize() and coarse:
@@ -1914,18 +2224,34 @@ class VoiceLabApp:
                         wav_tmp = self.temp_dir / f"_rerank_{i}.wav"
                         self._do_synthesize(vobj.path, transcript, wav_tmp)
                         ys, _ = librosa.load(str(wav_tmp), sr=sr, mono=True)
-                        ms = librosa.feature.mfcc(y=ys, sr=sr, n_mfcc=13)
-                        sv = np.concatenate([ms.mean(axis=1), ms.std(axis=1)]) * mfcc_weights
-                        rescore.append((float(np.linalg.norm(ref_vec - sv)), name))
+                        sv_feats = _extract_feats([ys])
+                        if _mode_s and ref_xvec is not None:
+                            # Mode S: x-vector cosine (synthesised candidate)
+                            try:
+                                sv_xvec = self._vmatch_extract_xvector(ys, sr)
+                                rescore.append((_cosine_dist(ref_xvec, sv_xvec), name))
+                            except Exception:
+                                rescore.append((_cosine_dist(ref_xvec,
+                                    self._vmatch_xvectors.get(name, sv_feats)), name))
+                        elif _rerank_emb and ref_feats is not None:
+                            # Mode A: cosine in feature space
+                            rescore.append((_cosine_dist(ref_feats, sv_feats), name))
+                        elif pop_mean is not None and ref_norm is not None:
+                            # Mode B: z-norm then cosine
+                            sv_norm = (sv_feats - pop_mean) / pop_std
+                            rescore.append((_cosine_dist(ref_norm, sv_norm), name))
+                        else:
+                            # Mode C / fallback: raw cosine on new features
+                            rescore.append((_cosine_dist(
+                                _extract_feats(all_windows), sv_feats), name))
                     except Exception:
-                        rescore.append((coarse[i][0], name))  # keep coarse score on fail
+                        rescore.append((coarse[i][0], name))
                     finally:
                         try:
                             (self.temp_dir / f"_rerank_{i}.wav").unlink()
                         except OSError:
                             pass
                 rescore.sort()
-                # Merge: re-ranked top-12 first, then remainder of coarse list
                 reranked_names = {n for _, n in rescore}
                 reranked = rescore + [(d, n) for d, n in coarse[12:] if n not in reranked_names]
             else:
@@ -2820,12 +3146,13 @@ class VoiceLabApp:
             if result is None:
                 result = arr * weight
             else:
-                # Voice bins can have different row counts; zero-pad to the longer
+                # Voice bins can have different total lengths; zero-pad the shorter
+                # one.  load_array returns a flat 1D array so padding is 1D.
                 n = max(len(result), len(arr))
                 if len(result) < n:
-                    result = np.pad(result, ((0, n - len(result)), (0, 0), (0, 0)))
+                    result = np.pad(result, (0, n - len(result)))
                 if len(arr) < n:
-                    arr = np.pad(arr, ((0, n - len(arr)), (0, 0), (0, 0)))
+                    arr = np.pad(arr, (0, n - len(arr)))
                 result = result + arr * weight
         return result
 
@@ -2856,18 +3183,27 @@ class VoiceLabApp:
             self.root.after(0, lambda m=msg: self.status_var.set(m))
             self.root.after(0, lambda m=msg: self._vmatch_progress_var.set(m))
 
-        # Reference fingerprint — weighted to match vmatch_find_match scoring
-        # (lower MFCC coefficients 2×, higher ones 0.2–0.5×; same for std half)
-        _mfcc_w = np.array(
-            [2.0, 2.0, 1.8, 1.6, 1.4, 1.2, 1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2,
-             1.5, 1.5, 1.3, 1.1, 0.9, 0.7, 0.5, 0.4, 0.3, 0.2, 0.2, 0.1, 0.1],
-            dtype=np.float32,
-        )
+        def _extract_vec(y: np.ndarray, sr: int) -> np.ndarray:
+            """78-dim: MFCC+Δ+ΔΔ mean+std — stable for audio-to-audio comparison."""
+            m  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+            d  = librosa.feature.delta(m)
+            d2 = librosa.feature.delta(m, order=2)
+            return np.concatenate([
+                m.mean(axis=1),  m.std(axis=1),
+                d.mean(axis=1),  d.std(axis=1),
+                d2.mean(axis=1), d2.std(axis=1),
+            ]).astype(np.float32)
+
+        def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
+            na, nb = np.linalg.norm(a), np.linalg.norm(b)
+            if na < 1e-8 or nb < 1e-8:
+                return 1.0
+            return float(1.0 - np.dot(a, b) / (na * nb))
+
         prog("Optimise: preparing reference audio…")
         try:
             y_ref, sr_ref, _ = self._vmatch_prepare_audio(ref_path)
-            m_ref = librosa.feature.mfcc(y=y_ref, sr=sr_ref, n_mfcc=13)
-            ref_vec = np.concatenate([m_ref.mean(axis=1), m_ref.std(axis=1)]) * _mfcc_w
+            ref_vec = _extract_vec(y_ref, sr_ref)
         except Exception as exc:
             prog(f"Optimise: reference error — {exc}")
             return
@@ -2928,9 +3264,8 @@ class VoiceLabApp:
                 # serializes requests internally via its own threading.Lock.
                 self._do_synthesize(bin_tmp, synth_text, wav_tmp, speed=opt_speed)
                 y, _ = librosa.load(str(wav_tmp), sr=sr_ref, mono=True)
-                m = librosa.feature.mfcc(y=y, sr=sr_ref, n_mfcc=13)
-                cand_vec = np.concatenate([m.mean(axis=1), m.std(axis=1)]) * _mfcc_w
-                return float(np.linalg.norm(ref_vec - cand_vec))
+                cand_vec = _extract_vec(y, sr_ref)
+                return _cosine_dist(ref_vec, cand_vec)
             except Exception:
                 return 999.0
             finally:
@@ -3061,6 +3396,45 @@ class VoiceLabApp:
                             best_dist, best_cand = d, trial_tup
                             fine_improved = True
 
+        # ── Nelder-Mead continuous refinement (scipy, optional) ──────────────
+        # Hill-climbing + fine pass work on a discrete grid. Nelder-Mead refines
+        # continuously from the current best without any fixed step size.
+        # Capped at 50 synthesis calls so it doesn't run too long.
+        try:
+            from scipy.optimize import minimize as _minimize
+            nm_voices = [n for n, _, _ in best_cand]
+            n_v = len(nm_voices)
+            if n_v > 0:
+                x0 = np.array(
+                    [w for _, w, _ in best_cand] + [p for _, _, p in best_cand],
+                    dtype=np.float64,
+                )
+
+                def _nm_obj(params: np.ndarray) -> float:
+                    ws = np.clip(params[:n_v], 0.01, 1.0)
+                    ps = np.clip(params[n_v:], -5.0, 5.0)
+                    cand = [(nm_voices[i], float(ws[i]), float(ps[i])) for i in range(n_v)]
+                    return score_emb(self._vmatch_build_embedding(cand))
+
+                prog("Optimise: Nelder-Mead refinement…")
+                nm = _minimize(
+                    _nm_obj, x0, method="Nelder-Mead",
+                    options={"maxfev": 50, "xatol": 0.002, "fatol": 0.001, "disp": False},
+                )
+                if nm.fun < best_dist:
+                    ws = np.clip(nm.x[:n_v], 0.01, 1.0)
+                    ws = ws / ws.sum()
+                    ps = np.clip(nm.x[n_v:], -5.0, 5.0)
+                    best_cand = [(nm_voices[i], float(ws[i]), float(ps[i])) for i in range(n_v)]
+                    best_dist = float(nm.fun)
+                    prog(f"Optimise: NM improved → {self._vmatch_fmt(best_cand)}  dist={best_dist:.3f}")
+                else:
+                    prog(f"Optimise: NM no improvement ({nm.fun:.3f} vs {best_dist:.3f})")
+        except ImportError:
+            pass  # scipy not installed — skip silently
+        except Exception as _nm_exc:
+            prog(f"Optimise: NM skipped ({_nm_exc})")
+
         # Store result
         self._vmatch_opt_emb   = self._vmatch_build_embedding(best_cand)
         self._vmatch_opt_cand  = best_cand
@@ -3068,12 +3442,12 @@ class VoiceLabApp:
         self._vmatch_opt_dist  = best_dist
         self._vmatch_opt_speed = opt_speed
 
-        # Quality label for the final dist score
-        if best_dist < 3.0:
+        # Quality label — cosine distance is 0–1 (lower = closer)
+        if best_dist < 0.15:
             quality = "excellent"
-        elif best_dist < 5.0:
+        elif best_dist < 0.30:
             quality = "good"
-        elif best_dist < 8.0:
+        elif best_dist < 0.50:
             quality = "fair"
         else:
             quality = "rough"

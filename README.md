@@ -26,10 +26,11 @@ A GUI tool for rating, blending, and approximating voices from the [Kokoro-82M](
 
 **Voice Match tab** — Drop in any WAV or MP3 of a real voice and approximate it from the Kokoro voice pool. Full pipeline:
 
-1. **Find Match** — measures reference F0, gates the pool to same-pitch voices, ranks all by weighted MFCC distance, then synthesises the top 12 saying your transcript and re-ranks by audio comparison. Eliminates content-mismatch contamination.
-2. **Optimise Blend** — seeds 5 starting candidates (singles and blends of the top pool voices), hill-climbs weights and pitch against the actual synthesised audio using MFCC distance as the fitness score, then runs a tight local refinement pass (±5% weights, ±0.5st pitch) to squeeze to the nearest minimum. Result score is labelled excellent / good / fair / rough.
-3. **Fine Tune** — the optimiser result auto-loads here. Three slots with voice dropdown, weight slider (showing normalised contribution %), and pitch slider (±5st). Per-slot preview and full blend preview. Export directly or send to the Mixer.
-4. **Blend Explorer** — each round injects 3 pool voices (18% each) into your current blend and offers them as A / B / C choices. Play each (synthesised saying your transcript), pick the closest — Fine Tune updates and the next round tests 3 more voices. Converges by ear on the missing ingredient the automatic optimiser didn't find.
+1. **Build Fingerprints** — synthesises a coverage sentence for every voice, extracts an 86-dim audio feature vector and a 256-dim canonical embedding, trains a Ridge regressor (audio → embedding space), and saves everything to `voice_match_mfcc.json`. Only needs to run once, or after adding new voices.
+2. **Find Match** — measures reference F0, gates the pool to same-pitch voices, ranks by embedding-space cosine distance (preferred) or audio-space cosine distance, then synthesises the top 12 saying your transcript and re-ranks by audio cosine distance. Eliminates content-mismatch contamination from the coverage sentence.
+3. **Optimise Blend** — seeds 5 starting candidates (singles and blends of top pool voices), hill-climbs weights and pitch against synthesised audio using cosine distance, runs a fine pass (±5% weights, ±0.5st pitch), then Nelder-Mead continuous refinement (scipy, optional). Result scored: excellent / good / fair / rough.
+4. **Fine Tune** — the optimiser result auto-loads here. Three slots with voice dropdown, weight slider (normalised contribution %), and pitch slider (±5st). Speed slider (0.5–2.0×) for pacing control. Per-slot preview and full blend preview. Export directly or send to the Mixer.
+5. **Blend Explorer** — each round injects 3 pool voices (18% each) into your current blend and offers them as A / B / C choices. Play each (synthesised saying your transcript), pick the closest — Fine Tune updates and the next round tests 3 more voices. Export button included.
 
 Requires `librosa` for fingerprints and matching. Transcription requires `faster-whisper` or `openai-whisper`.
 
@@ -66,12 +67,12 @@ voices/
 ### 2. Install Python dependencies
 
 ```bash
-pip install onnxruntime misaki[en] soundfile numpy pillow scikit-learn
+pip install onnxruntime misaki[en] soundfile numpy pillow scikit-learn librosa
 ```
 
 For GPU support (optional — CUDA required):
 ```bash
-pip install onnxruntime-gpu misaki[en] soundfile numpy pillow scikit-learn
+pip install onnxruntime-gpu misaki[en] soundfile numpy pillow scikit-learn librosa
 ```
 
 `ffmpeg` is optional — only needed if you use pitch shift or speed controls that deviate from default (pitch ≠ 0, speed ≠ 1.0) **and** the Bake slot pitch checkbox is **off**. With baking enabled, pitch is applied at the embedding level and ffmpeg is not required.
@@ -102,30 +103,58 @@ The tool auto-detects the `voices/` folder and working directory on first launch
 
 5. **Use Trait Match** — Set target trait sliders in the Mixer tab → **Suggest 3 Voices**. Loads the best matches into the slots.
 
-6. **Match a real voice** — Voice Match tab. Browse to a WAV or MP3, transcribe or paste the text, Build Fingerprints (once), Find Match, Optimise Blend. Use Fine Tune and Blend Explorer to converge by ear.
+6. **Match a real voice** — Voice Match tab. Browse to a WAV or MP3, transcribe or paste the text, **Build Fingerprints** (once), **Find Match**, **Optimise Blend**. Use Fine Tune and Blend Explorer to converge by ear.
 
 ---
 
 ## Voice Match: how it works
 
+### Architecture overview
+
+The matching pipeline operates in Kokoro's embedding space rather than raw audio feature space. MFCC similarity in audio space doesn't correlate reliably with Kokoro identity similarity — one voice can produce similar MFCCs for different texts, and different voices can produce similar MFCCs for the same text. The solution: predict where the reference sits in Kokoro's 256-dim voice embedding space and compare directly.
+
+```
+Reference audio
+  → 86-dim features (MFCC + Δ + ΔΔ + log-mel + spectral contrast)
+  → Ridge regressor (trained on voice corpus)
+  → predicted 256-dim Kokoro embedding
+  → cosine distance to each voice's canonical embedding
+  → top 12 → synthesis re-rank → result
+```
+
+Each voice `.bin` has a **canonical embedding**: the mean of all its rows, giving a stable single identity vector used for matching.
+
 ### Find Match pipeline
 
-1. Loads reference audio, trims silence, extracts the best 8-second window by RMS energy.
-2. Measures reference F0 (fundamental frequency) with `librosa.pyin`. Filters the voice pool to voices within ±40% of that F0 — prevents wrong-gender matches.
-3. Computes weighted MFCC distance between the reference and each voice's pre-built fingerprint. Lower coefficients (timbre, formant shape) are weighted 2×; higher ones (content-dependent) are weighted 0.2–0.5×.
-4. Takes the top 12 candidates, synthesises each saying your transcript text, re-compares MFCCs against the reference. This eliminates content-mismatch contamination from the coverage sentence used to build fingerprints.
+1. Loads reference audio, trims silence, extracts the best 8-second window by RMS energy. Peak-normalises before analysis.
+2. Measures reference F0 with `librosa.pyin`. Filters the voice pool to voices within ±40% of that F0 — prevents cross-gender matches.
+3. **Mode A (preferred)** — extracts 86-dim features from the reference, multiplies by the Ridge regressor to predict a Kokoro embedding, ranks all voices by cosine distance to their canonical embeddings. No synthesis needed for the coarse pass.
+4. **Mode B (fallback)** — if the regressor is absent, z-normalises features across the population and ranks by cosine distance in feature space.
+5. **Mode C (legacy)** — if fingerprints are pre-v2, falls back to weighted MFCC L2 distance with a rebuild prompt.
+6. Takes the top 12, synthesises each saying the transcript, re-ranks by audio cosine distance. Eliminates content-mismatch contamination from the coverage sentence.
 
-For reference audio longer than 20 seconds, the pipeline averages MFCC measurements across three windows (start, middle, end) for a more stable fingerprint.
+For reference audio longer than 20 seconds, the pipeline averages feature measurements across three windows (start, middle, end).
 
 ### Optimise Blend
 
-Seeds 5 starting candidates (the top single voice, two 70/30 blends, a 60/25/15 three-way, and a balanced three-way). For each candidate: writes the blended embedding to a temp `.bin`, synthesises it saying the transcript text, measures MFCC distance against the reference audio. Hill-climbs with random weight and pitch mutations (±15%) until 2 consecutive iterations produce no improvement. Then runs a deterministic fine pass: tries ±5% on each voice weight and ±0.5st on each pitch slot, synthesising and scoring each, until no further improvement is found.
+Seeds 5 starting candidates (the top single voice, two 70/30 blends, a 60/25/15 three-way, and a balanced three-way). Three optimisation stages run in sequence:
 
-The final distance is labelled: **excellent** (<3.0), **good** (<5.0), **fair** (<8.0), **rough** (≥8.0).
+1. **Hill-climb** — random weight and pitch mutations (±15%), stops after 2 consecutive no-improve rounds (max 10 iterations).
+2. **Fine pass** — deterministic ±5% on each weight, ±0.5st on each pitch, up to 5 full sweeps.
+3. **Nelder-Mead** (requires `scipy`) — continuous gradient-free refinement from the best candidate, capped at 50 synthesis evaluations.
+
+All scoring uses cosine distance (78-dim MFCC+Δ+ΔΔ mean+std) between synthesised candidate and reference audio.
+
+Speed calibration: measures reference audio duration vs. Kokoro's natural synthesis pace for the transcript, seeds the speed slider with the ratio. Override manually — slider range is 0.5–2.0×.
+
+Quality thresholds (cosine distance, lower = closer):
+- **excellent** < 0.15 — **good** < 0.30 — **fair** < 0.50 — **rough** ≥ 0.50
 
 ### Fine Tune
 
-Sliders for each voice slot: weight (0–100, normalised to show actual contribution %) and pitch (±5 semitones). Weights are always normalised before use — 80/40/0 and 2/1/0 produce identical blends. Preview individual slots or the full blend. Export directly or load into the Mixer for further work.
+Sliders for each voice slot: weight (0–100, normalised to show actual contribution %) and pitch (±5 semitones). Weights are always normalised before use — 80/40/0 and 2/1/0 produce identical blends. Speed slider (0.5–2.0×) applies to all previews and exports. Export name field (shared with Mixer tab) sets the filename for all Voice Match exports. Sidecar JSON records `matched_speed` alongside the blend recipe.
+
+Preview individual slots or the full blend. Export directly or load into the Mixer for further work.
 
 ### Blend Explorer
 
@@ -136,7 +165,7 @@ After optimising, the Explorer tests whether adding a small amount of another vo
 3. For each: creates a variant = current blend (82%) + new voice (18%). Because embedding mixing is linear, this is mathematically identical to a flat multi-component recipe — no temp file needed.
 4. Synthesises A / B / C saying your transcript and offers them for comparison.
 
-Pick the closest to your target → Fine Tune updates, next round tests 3 more voices from the pool. Repeat until satisfied. Each round the injected voice either gets absorbed into the base (if picked) or discarded (if not), so the blend stays at most 3 components.
+Pick the closest to your target → Fine Tune updates, next round tests 3 more voices from the pool. Repeat until satisfied. Export button saves the current Fine Tune state directly from the Explorer panel.
 
 ---
 
@@ -171,12 +200,27 @@ Always normalized. Match the raw float32 format of the vendor voices and can be 
 
 ---
 
+## Style extraction (all synthesis paths)
+
+All synthesis — in the persistent server, the standalone `infer.py`, and the analysis script — uses **multi-frame Hanning-pooled style selection** instead of single-timestep lookup.
+
+For a given token count `n`, a window of ±4 frames is selected from the `.bin`, weighted by a Hanning window (tapered edges, peak at centre), and the weighted mean is used as the style vector. This removes the token-length dependency that previously caused the same voice to sound slightly different at different text lengths.
+
+---
+
+## Rebuilding fingerprints (if you had a previous version)
+
+If you have a `voice_match_mfcc.json` built before this update, the tool will detect it as legacy format and fall back to weighted MFCC distance. A status message says `Legacy fingerprints — rebuild for embedding-space matching`.
+
+Click **Build Fingerprints** in the Voice Match tab (server must be running) to rebuild. The status will show `Ready — N/N voices fingerprinted [regressor ✓]` when complete. The old file is overwritten in place.
+
+---
+
 ## Extending voice analysis coverage
 
 The tool ships with acoustic analysis data for voices that were cached in the original run. If you have voices that are missing from the analysis CSV (or you've added custom `.bin` files), run:
 
 ```bash
-pip install librosa
 python extend_voice_analysis.py
 ```
 
@@ -200,15 +244,8 @@ After running, restart Voice Lab (or click **Re-cache All Voices**) to rebuild t
 | `infer.py` | Standalone synthesis script (also used as fallback) |
 | `voice_lab_config.json` | Session config — auto-saved, contains your local paths |
 | `voice_ratings.json` | Your voice ratings — created when you first save |
+| `voice_match_mfcc.json` | Voice fingerprints built by Build Fingerprints |
 | `logo.png` | The rat |
-
----
-
-## Exported `.bin` files
-
-Blended voice files are saved to the `exports/` folder by default. They're the same format as the voices in `voices/` — raw little-endian float32, 256 values per row, no header — and can be dropped in alongside them to use with any Kokoro-compatible tool.
-
-The sidecar JSON (saved alongside the `.bin`) records what voices were blended and at what weights, so you can recreate or adjust the mix later.
 
 ---
 
@@ -231,7 +268,8 @@ The sidecar JSON (saved alongside the `.bin`) records what voices were blended a
 | `numpy` | Yes | Voice bin arithmetic and tensor operations |
 | `scikit-learn` | Recommended | Required for Bake slot pitch; gracefully disabled if absent |
 | `Pillow` | Recommended | Logo transparency support; gracefully absent otherwise |
-| `librosa` | Required for Voice Match | MFCC fingerprinting, F0 measurement, acoustic analysis; also needed for `extend_voice_analysis.py` |
+| `librosa` | Required for Voice Match | Feature extraction, F0 measurement, acoustic analysis; also needed for `extend_voice_analysis.py` |
+| `scipy` | Recommended | Nelder-Mead refinement in Optimise Blend; skipped gracefully if absent |
 | `faster-whisper` | Optional | Voice Match transcription (preferred — smaller/faster) |
 | `openai-whisper` | Optional | Voice Match transcription (fallback if faster-whisper absent) |
 | `ffmpeg` | Optional | Required for non-default pitch/speed when bake is off |
@@ -241,8 +279,6 @@ Python 3.10 or later.
 ---
 
 ## Acknowledgements
-
-This tool is built on the work of several projects:
 
 **[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)** by [hexgrad](https://huggingface.co/hexgrad) — the TTS model this tool is built around. Kokoro is an open-weight, Apache 2.0 licensed text-to-speech model. All voice `.bin` files and the ONNX model are from this release.
 
@@ -267,126 +303,3 @@ This tool is built on the work of several projects:
 ---
 
 *Built for [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) by hexgrad.*
-
-
----
-
-# 🔧 UPDATE: Embedding-Based Voice Matching (New Pipeline)
-
-## Architecture Change
-
-Old:
-audio → MFCC → compare → search → synth
-
-New:
-audio → feature vector → embedding → synth
-
----
-
-## Key Additions
-
-### Canonical Embeddings
-Each voice `.bin` is reduced to a stable identity vector:
-mean(all_frames)
-
-Used for:
-- matching
-- regression targets
-- manifold projection
-
----
-
-### New Fingerprint (Replaces MFCC stats)
-
-Features (~120–150 dims):
-- MFCC + Δ + ΔΔ
-- log-mel spectrogram
-- spectral contrast
-- F0 statistics
-
-Generated via:
-extend_voice_analysis.py
-
----
-
-### Embedding Regressor
-
-Linear mapping:
-audio_features → Kokoro embedding
-
-Trained using:
-np.linalg.lstsq(X, Y)
-
----
-
-### Feature Whitening
-
-(X - mean) / std
-
-Improves regression stability.
-
----
-
-### Manifold Projection
-
-Predicted embeddings are snapped to nearest valid voices:
-mean(nearest_k canonical embeddings)
-
-Prevents:
-- crackling
-- invalid outputs
-
----
-
-### Normalized Mixing Fix
-
-emb = emb / ||emb||
-out += emb * weight
-out /= ||out||
-
-Prevents distortion and voice collapse.
-
----
-
-## Removed
-
-- MFCC matching pipeline
-- voice_match_mfcc.json dependency
-- hill-climb optimizer
-- blend explorer logic
-
----
-
-## Required Migration
-
-1. Rebuild fingerprints:
-   python extend_voice_analysis.py
-
-2. Delete:
-   voice_match_mfcc.json
-
-3. Remove any broken/generated `.bin` files
-
----
-
-## Known Constraints
-
-Kokoro embeddings are style-based, not true speaker embeddings.
-Cloning fidelity is bounded without external speaker encoder (e.g. ECAPA).
-
----
-
-## Debugging
-
-### Crackling
-Cause:
-- off-manifold embeddings
-- invalid normalization
-
-Fix:
-- ensure projection active
-- rebuild analysis
-- remove bad .bin files
-
----
-
