@@ -6,6 +6,28 @@ A GUI tool for rating, blending, and approximating voices from the [Kokoro-82M](
 
 ---
 
+## Update (2026-05-05)
+
+Recent Voice Match updates in this build:
+
+- **Gender guard modes**: `off` / `soft` / `strict`.
+- **Manual reference gender override**: `auto` / `male` / `female` (used by matching, rerank, and mixer dominant-slot selection).
+- **Sampling modes**:
+  - `classic` (original behavior)
+  - `medoid_dual` (representative anchor + expressive companion window)
+- **Sample prosody map** toggle:
+  - maps reference pitch to mixer slot pitch offsets
+  - maps reference speaking pace to mixer output speed
+- **Optimizer alignment**: Build Best Blend now follows the selected sampling mode as well.
+
+Bug fixes included:
+
+- Strict gender mode now reranks a larger gender-filtered pool (instead of only a tiny top slice).
+- Prosody speed mapping now uses speech-window duration instead of raw file duration.
+- Sampling mode now affects speaker-xvector matching too (not just embedding modes).
+
+---
+
 ## What it does
 
 **Ratings tab** — Work through all 54 Kokoro voices and rate each one on 8 perceptual axes: age, authority, clarity, energy, gender presentation, pitch, roughness, and warmth. Navigate with arrow keys. Ratings auto-save as you go. Scale is 1–10.
@@ -268,7 +290,6 @@ After running, restart Voice Lab (or click **Re-cache All Voices**) to rebuild t
 
 ## Notes
 
-- Cloning is... well... it's a bonus feature. A mix of the nature of Kokoro, time available, and trying to strike a balance between making an accessible tool and one that requires significant time and resources. Results can be good... Results can be good with tweaking... and results can sometimes be "... huh?". It's fun to play about with and definitely an easy way to generate new voices though. 
 - The tool saves your config (paths, slot settings, session state) to `voice_lab_config.json` automatically. This file is gitignored by default since it contains your local paths.
 - `voice_ratings.json` is also gitignored — if you want to share your ratings with someone, commit it manually or send it directly.
 - The `preview_cache/` folder holds pre-generated WAVs keyed to the test sentence. Delete it to force regeneration (e.g. after changing the test sentence). Or use **Re-cache All Voices** in the Config tab.

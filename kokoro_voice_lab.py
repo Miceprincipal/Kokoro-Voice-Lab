@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,7 @@ APP_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = APP_DIR / "voice_lab_config.json"
 DEFAULT_RATINGS_PATH = APP_DIR / "voice_ratings.json"
 DEFAULT_EXPORT_DIR = APP_DIR / "exports"
-DEFAULT_ANALYSIS_CSV_PATH = APP_DIR / "cache" / "voice-audition" / "voice-analysis.csv"
+DEFAULT_ANALYSIS_CSV_PATH = APP_DIR.parent.parent / "cache" / "voice-audition" / "voice-analysis.csv"
 VOICE_MATCH_MFCC_PATH     = APP_DIR / "voice_match_mfcc.json"
 VOICE_MATCH_SPEAKER_PATH  = APP_DIR / "voice_match_speaker.json"
 VOICE_MATCH_SPEAKER_MODEL = APP_DIR / "voxceleb_resnet34.onnx"
@@ -140,10 +141,17 @@ class EmbeddedAudioPlayer:
 
 
 class KokoroSynthAdapter:
-    def __init__(self, command_template: str = "", ffmpeg_path: str = "ffmpeg", working_dir: str = "") -> None:
+    def __init__(
+        self,
+        command_template: str = "",
+        ffmpeg_path: str = "ffmpeg",
+        working_dir: str = "",
+        unsafe_shell_mode: bool = False,
+    ) -> None:
         self.command_template = command_template.strip()
         self.ffmpeg_path = ffmpeg_path.strip() or "ffmpeg"
         self.working_dir = working_dir.strip()
+        self.unsafe_shell_mode = bool(unsafe_shell_mode)
 
     def is_configured(self) -> bool:
         return bool(self.command_template)
@@ -155,7 +163,11 @@ class KokoroSynthAdapter:
         if "{speed}" in self.command_template:
             fmt["speed"] = f"{speed:.4f}"
         cmd = self.command_template.format(**fmt)
-        subprocess.run(cmd, shell=True, check=True, cwd=self.working_dir or None)
+        if self.unsafe_shell_mode:
+            subprocess.run(cmd, shell=True, check=True, cwd=self.working_dir or None)
+        else:
+            argv = self._build_safe_argv(cmd)
+            subprocess.run(argv, shell=False, check=True, cwd=self.working_dir or None)
         if not out_wav.exists():
             raise RuntimeError(f"Synthesis completed but no output file: {out_wav}")
         # If the template didn't consume {speed} and speed deviates from 1.0,
@@ -202,6 +214,30 @@ class KokoroSynthAdapter:
     @staticmethod
     def is_identity(speed: float, pitch: float) -> bool:
         return abs(pitch) < 1e-6 and abs(speed - 1.0) < 0.005
+
+    @staticmethod
+    def _build_safe_argv(cmd: str) -> list[str]:
+        """Parse formatted command into argv without invoking a shell.
+
+        Supports either:
+        - JSON array templates: ["python","infer.py","--voice","{voice}",...]
+        - Plain command strings parsed with shlex.split.
+        """
+        s = cmd.strip()
+        if not s:
+            raise RuntimeError("Synthesis command is empty.")
+        if s.startswith("["):
+            try:
+                arr = json.loads(s)
+            except Exception as exc:
+                raise RuntimeError(f"Invalid JSON command template: {exc}") from exc
+            if not isinstance(arr, list) or not arr or not all(isinstance(x, str) for x in arr):
+                raise RuntimeError("JSON command template must be a non-empty array of strings.")
+            return arr
+        argv = shlex.split(s, posix=False)
+        if not argv:
+            raise RuntimeError("Command template produced no executable argv.")
+        return argv
 
 
 class DirectAssetBackend:
@@ -532,6 +568,13 @@ class VoiceLabApp:
         self._vmatch_speaker_var        = tk.StringVar(value="No model")
         self._vmatch_active_mode_var    = tk.StringVar(value="— (run Find Best Voice)")
         self._vmatch_transcript_src_var = tk.StringVar(value="")
+        self._vmatch_ref_gender_override_var = tk.StringVar(value="auto")
+        self._vmatch_gender_guard_var   = tk.StringVar(value="soft")
+        self._vmatch_sampling_var       = tk.StringVar(value="classic")
+        self._vmatch_prosody_map_var    = tk.BooleanVar(value=False)
+        self._vmatch_ref_gender: str = "unknown"
+        self._vmatch_ref_f0_hz: float = 0.0
+        self._vmatch_ref_speed_mult: float = 1.0
         self._vmatch_scores: list[tuple[float, str]] = []
         self._vmatch_results_listbox: tk.Listbox | None = None
         self._vmatch_transcript_widget: tk.Text | None = None
@@ -575,6 +618,7 @@ class VoiceLabApp:
         self.command_var       = tk.StringVar(value="")
         self.ffmpeg_var        = tk.StringVar(value="ffmpeg")
         self.working_dir_var   = tk.StringVar(value="")
+        self.unsafe_shell_var  = tk.BooleanVar(value=False)
         self.export_dir_var    = tk.StringVar(value=str(DEFAULT_EXPORT_DIR))
         self.export_name_var   = tk.StringVar(value="mixed_voice")
         self.normalize_var     = tk.BooleanVar(value=True)
@@ -1294,8 +1338,13 @@ class VoiceLabApp:
         ttk.Entry(cf, textvariable=self.working_dir_var, width=100).grid(row=2, column=1, sticky="ew", padx=(8, 0), pady=(8, 0))
         ttk.Label(cf, text="ffmpeg path").grid(row=3, column=0, sticky="w")
         ttk.Entry(cf, textvariable=self.ffmpeg_var, width=40).grid(row=3, column=1, sticky="w", padx=(8, 0))
-        ttk.Checkbutton(cf, text="Autosave config on change", variable=self.autosave_var).grid(row=4, column=1, sticky="w", pady=(8, 0))
-        ttk.Button(cf, text="Save Config Now", command=self.save_config).grid(row=5, column=1, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(
+            cf,
+            text="Unsafe legacy shell mode (allows shell metacharacters; use only for trusted local templates)",
+            variable=self.unsafe_shell_var,
+        ).grid(row=4, column=1, sticky="w", pady=(8, 0))
+        ttk.Checkbutton(cf, text="Autosave config on change", variable=self.autosave_var).grid(row=5, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(cf, text="Save Config Now", command=self.save_config).grid(row=6, column=1, sticky="w", pady=(8, 0))
         cf.columnconfigure(1, weight=1)
 
         diag = ttk.LabelFrame(parent, text="Asset Diagnostics", padding=10)
@@ -1387,6 +1436,32 @@ class VoiceLabApp:
         self._vmatch_optimise_btn = _opt_btn
         ttk.Checkbutton(act_row, text="x-vec rerank",
                         variable=self._vmatch_xvrerank_var).pack(side="left", padx=(8, 0))
+        ttk.Label(act_row, text="Gender guard:").pack(side="left", padx=(10, 4))
+        ttk.Combobox(
+            act_row,
+            textvariable=self._vmatch_gender_guard_var,
+            values=["off", "soft", "strict"],
+            state="readonly",
+            width=7,
+        ).pack(side="left")
+        ttk.Label(act_row, text="Ref gender:").pack(side="left", padx=(10, 4))
+        ttk.Combobox(
+            act_row,
+            textvariable=self._vmatch_ref_gender_override_var,
+            values=["auto", "male", "female"],
+            state="readonly",
+            width=7,
+        ).pack(side="left")
+        ttk.Label(act_row, text="Sampling:").pack(side="left", padx=(10, 4))
+        ttk.Combobox(
+            act_row,
+            textvariable=self._vmatch_sampling_var,
+            values=["classic", "medoid_dual"],
+            state="readonly",
+            width=12,
+        ).pack(side="left")
+        ttk.Checkbutton(act_row, text="Sample prosody map",
+                        variable=self._vmatch_prosody_map_var).pack(side="left", padx=(8, 0))
         ttk.Button(act_row, text="▶  Preview",
                    command=self.vmatch_preview_result).pack(side="left", padx=(8, 0))
         ttk.Button(act_row, text="■  Stop",
@@ -2148,8 +2223,14 @@ class VoiceLabApp:
                     voiced_f0 is not None and np.any(voiced_f0 > 0)) else 0.0
             except Exception:
                 ref_f0 = 0.0
+            self._vmatch_ref_gender = self._infer_ref_gender_from_f0(ref_f0)
+            effective_gender = self._effective_ref_gender()
             f0_label = f"{ref_f0:.0f} Hz" if ref_f0 > 0 else "unknown"
-            note += f"  |  ref F0 ≈ {f0_label}"
+            if effective_gender != self._vmatch_ref_gender:
+                note += (f"  |  ref F0 ≈ {f0_label}  |  ref gender ≈ {self._vmatch_ref_gender}"
+                         f" (override: {effective_gender})")
+            else:
+                note += f"  |  ref F0 ≈ {f0_label}  |  ref gender ≈ {effective_gender}"
             self.root.after(0, lambda: self.status_var.set(f"Analysing… ({note})"))
 
             # ── Local helpers ─────────────────────────────────────────────────
@@ -2168,6 +2249,20 @@ class VoiceLabApp:
                     ]))
                 return np.mean(vecs, axis=0).astype(np.float32)
 
+            def _pick_medoid_window(windows: list[np.ndarray]) -> tuple[np.ndarray, int]:
+                """Return most-representative window by cosine medoid in feature space."""
+                if len(windows) <= 1:
+                    return windows[0], 0
+                feats = [_extract_feats([w]) for w in windows]
+                dmat = np.zeros((len(feats), len(feats)), dtype=np.float32)
+                for i in range(len(feats)):
+                    for j in range(i + 1, len(feats)):
+                        d = _cosine_dist(feats[i], feats[j])
+                        dmat[i, j] = d
+                        dmat[j, i] = d
+                idx = int(np.argmin(dmat.mean(axis=1)))
+                return windows[idx], idx
+
             def _cosine_dist(a: np.ndarray, b: np.ndarray) -> float:
                 na, nb = np.linalg.norm(a), np.linalg.norm(b)
                 if na < 1e-8 or nb < 1e-8:
@@ -2184,6 +2279,55 @@ class VoiceLabApp:
                 if vf0 <= 0:
                     return True
                 return abs(ref_f0 - vf0) / ref_f0 < 0.40
+
+            sample_mode = self._vmatch_sampling_var.get().strip().lower()
+            anchor_window = y
+            dual_window = y
+            if sample_mode == "medoid_dual" and len(all_windows) > 1:
+                anchor_window, medoid_idx = _pick_medoid_window(all_windows)
+                # "dual" anchor: most expressive by median |f0 - ref_f0| + RMS
+                best_expr = -1.0
+                best_expr_idx = medoid_idx
+                for wi, w in enumerate(all_windows):
+                    try:
+                        wf0, wv, _ = librosa.pyin(
+                            w, fmin=50, fmax=500, sr=sr, frame_length=2048, hop_length=512)
+                        voiced_w = wf0[wv] if wv is not None else wf0
+                        mf0 = float(np.median(voiced_w[voiced_w > 0])) if (
+                            voiced_w is not None and np.any(voiced_w > 0)) else ref_f0
+                    except Exception:
+                        mf0 = ref_f0
+                    wrms = float(np.sqrt(np.mean(w ** 2)))
+                    expr = abs(mf0 - ref_f0) + (wrms * 40.0)
+                    if expr > best_expr:
+                        best_expr = expr
+                        best_expr_idx = wi
+                dual_window = all_windows[best_expr_idx]
+                note += f"  |  sampling=medoid_dual (anchor W{medoid_idx+1}, expr W{best_expr_idx+1})"
+            elif sample_mode == "medoid_dual":
+                note += "  |  sampling=medoid_dual (single window)"
+            else:
+                note += "  |  sampling=classic"
+
+            if sample_mode == "medoid_dual":
+                ref_feats_target = (
+                    0.7 * _extract_feats([anchor_window]) +
+                    0.3 * _extract_feats([dual_window])
+                ).astype(np.float32)
+            else:
+                ref_feats_target = _extract_feats(all_windows)
+
+            # Cache lightweight prosody targets from the sample for optional mapper.
+            self._vmatch_ref_f0_hz = float(ref_f0) if ref_f0 > 0 else 0.0
+            try:
+                tx = self._vmatch_match_text()
+                words = max(1, len(tx.split()))
+                speech_dur = max(len(anchor_window) / sr, 1.0)
+                ref_wps = words / speech_dur
+                baseline_wps = 2.7  # ~162 wpm speaking baseline
+                self._vmatch_ref_speed_mult = float(np.clip(ref_wps / baseline_wps, 0.6, 1.6))
+            except Exception:
+                self._vmatch_ref_speed_mult = 1.0
 
             # ── Step 2: coarse ranking ────────────────────────────────────────
             passed, gated_out = 0, 0
@@ -2207,7 +2351,21 @@ class VoiceLabApp:
                 try:
                     self.root.after(0, lambda: self.status_var.set(
                         "Extracting speaker embedding…"))
-                    ref_xvec = self._vmatch_extract_xvector(y, sr)
+                    xvec_windows = [anchor_window] if sample_mode == "medoid_dual" else all_windows
+                    xvec_vecs: list[np.ndarray] = []
+                    for w in xvec_windows:
+                        try:
+                            xvec_vecs.append(self._vmatch_extract_xvector(w, sr))
+                        except Exception:
+                            pass
+                    if not xvec_vecs:
+                        ref_xvec = self._vmatch_extract_xvector(y, sr)
+                    else:
+                        xstack = np.stack(xvec_vecs, axis=0).astype(np.float32)
+                        ref_xvec = xstack.mean(axis=0)
+                        nrm = np.linalg.norm(ref_xvec)
+                        if nrm > 1e-8:
+                            ref_xvec = ref_xvec / nrm
                     mode_note    = "  [speaker match]"
                     _active_label = "Speaker match"
                     _result_tag  = "[spkr]"
@@ -2227,7 +2385,7 @@ class VoiceLabApp:
             if not _mode_s and _fmt2 and self._vmatch_regressor is not None and self._vmatch_canonical:
                 # ── Mode A: embedding-space ────────────────────────────────────
                 self.root.after(0, lambda: self.status_var.set("Extracting reference features…"))
-                ref_feats = _extract_feats(all_windows)
+                ref_feats = ref_feats_target
                 pred_emb  = (ref_feats @ self._vmatch_regressor).astype(np.float32)
                 mode_note    = "  [fast match]"
                 _active_label = "Fast match (embedding)"
@@ -2244,7 +2402,7 @@ class VoiceLabApp:
             elif not _mode_s and _fmt2:
                 # ── Mode B: new features, regressor absent ────────────────────
                 self.root.after(0, lambda: self.status_var.set("Extracting reference features…"))
-                ref_feats = _extract_feats(all_windows)
+                ref_feats = ref_feats_target
                 fp_raw = {
                     name: np.array(fp["features"], dtype=np.float32)
                     for name, fp in self._vmatch_mfcc_db.items() if "features" in fp
@@ -2313,13 +2471,27 @@ class VoiceLabApp:
             reranked = list(coarse)
             transcript = self._vmatch_match_text()
             if self._can_synthesize() and coarse:
-                top_for_rerank = coarse[:12]
+                strict_mode = self._vmatch_gender_guard_var.get().strip().lower() == "strict"
+                eff_ref_gender = self._effective_ref_gender()
+                if strict_mode and eff_ref_gender in ("male", "female"):
+                    filtered = [
+                        (d, n) for d, n in coarse
+                        if self._voice_gender_from_name(n) in ("unknown", eff_ref_gender)
+                    ]
+                    top_for_rerank = (filtered if filtered else coarse)[:30]
+                else:
+                    top_for_rerank = coarse[:12]
                 self.root.after(0, lambda: self.status_var.set(
                     f"Re-ranking top {len(top_for_rerank)} via synthesis…"))
                 rescore: list[tuple[float, str]] = []
                 for i, (_, name) in enumerate(top_for_rerank):
                     self.root.after(0, lambda n=name, idx=i, tot=len(top_for_rerank):
                         self.status_var.set(f"Re-rank {idx+1}/{tot}: {n}"))
+                    if (strict_mode
+                            and eff_ref_gender in ("male", "female")
+                            and self._voice_gender_from_name(name) not in ("unknown", eff_ref_gender)):
+                        rescore.append((9.0, name))
+                        continue
                     try:
                         vobj = self.voice_lib.get(name)
                         wav_tmp = self.temp_dir / f"_rerank_{i}.wav"
@@ -2330,21 +2502,26 @@ class VoiceLabApp:
                             # Mode S: x-vector cosine (synthesised candidate)
                             try:
                                 sv_xvec = self._vmatch_extract_xvector(ys, sr)
-                                rescore.append((_cosine_dist(ref_xvec, sv_xvec), name))
+                                d = _cosine_dist(ref_xvec, sv_xvec) + self._gender_mismatch_penalty(name)
+                                rescore.append((d, name))
                             except Exception:
-                                rescore.append((_cosine_dist(ref_xvec,
-                                    self._vmatch_xvectors.get(name, sv_feats)), name))
+                                d = _cosine_dist(ref_xvec, self._vmatch_xvectors.get(name, sv_feats))
+                                d += self._gender_mismatch_penalty(name)
+                                rescore.append((d, name))
                         elif _rerank_emb and ref_feats is not None:
                             # Mode A: cosine in feature space
-                            rescore.append((_cosine_dist(ref_feats, sv_feats), name))
+                            d = _cosine_dist(ref_feats, sv_feats) + self._gender_mismatch_penalty(name)
+                            rescore.append((d, name))
                         elif pop_mean is not None and ref_norm is not None:
                             # Mode B: z-norm then cosine
                             sv_norm = (sv_feats - pop_mean) / pop_std
-                            rescore.append((_cosine_dist(ref_norm, sv_norm), name))
+                            d = _cosine_dist(ref_norm, sv_norm) + self._gender_mismatch_penalty(name)
+                            rescore.append((d, name))
                         else:
                             # Mode C / fallback: raw cosine on new features
-                            rescore.append((_cosine_dist(
-                                _extract_feats(all_windows), sv_feats), name))
+                            d = _cosine_dist(ref_feats_target, sv_feats)
+                            d += self._gender_mismatch_penalty(name)
+                            rescore.append((d, name))
                     except Exception:
                         rescore.append((coarse[i][0], name))
                     finally:
@@ -2382,7 +2559,17 @@ class VoiceLabApp:
         if not self._vmatch_scores:
             self.status_var.set("Run Find Best Voice first.")
             return
-        top = self._vmatch_scores[:3]
+        ranked = list(self._vmatch_scores)
+        guard_mode = self._vmatch_gender_guard_var.get().strip().lower()
+        eff_ref_gender = self._effective_ref_gender()
+        if guard_mode != "off" and eff_ref_gender in ("male", "female"):
+            search_pool = ranked[:20] if guard_mode == "strict" else ranked[:10]
+            for i, (_, name) in enumerate(search_pool):
+                if self._voice_gender_from_name(name) == eff_ref_gender:
+                    if i != 0:
+                        ranked[0], ranked[i] = ranked[i], ranked[0]
+                    break
+        top = ranked[:3]
         inv = [1.0 / (d + 1e-9) for d, _ in top]
         total_inv = sum(inv)
         weights = [100.0 * v / total_inv for v in inv]
@@ -2392,7 +2579,12 @@ class VoiceLabApp:
                 self.active_vars[i].set(True)
                 self.voice_vars[i].set(name)
                 self.weight_vars[i].set(round(weights[i], 1))
-                self.pitch_vars[i].set(0.0)
+                slot_pitch = 0.0
+                if self._vmatch_prosody_map_var.get() and self._vmatch_ref_f0_hz > 0:
+                    vf0 = self._voice_f0_hz(name)
+                    if vf0 > 0:
+                        slot_pitch = float(np.clip(12.0 * np.log2(self._vmatch_ref_f0_hz / vf0), -4.0, 4.0))
+                self.pitch_vars[i].set(round(slot_pitch, 2))
                 self.speed_vars[i].set(1.0)
             else:
                 self.active_vars[i].set(False)
@@ -2400,7 +2592,11 @@ class VoiceLabApp:
                 self.weight_vars[i].set(0.0)
                 self.pitch_vars[i].set(0.0)
                 self.speed_vars[i].set(1.0)
-        self.status_var.set("Top 3 loaded into Mixer — switch to Mixer tab to preview")
+        if self._vmatch_prosody_map_var.get():
+            self.mix_speed_var.set(round(float(np.clip(self._vmatch_ref_speed_mult, 0.6, 1.6)), 2))
+            self.status_var.set("Top 3 loaded into Mixer with sample prosody map")
+        else:
+            self.status_var.set("Top 3 loaded into Mixer — switch to Mixer tab to preview")
         self._recompute_summary()
 
     def vmatch_export_direct(self) -> None:
@@ -2987,6 +3183,58 @@ class VoiceLabApp:
         desc = row.get("description", "").strip()
         self._slot_info_vars[idx].set(f"{f0} Hz  ·  {desc}" if f0 and desc else f"{f0} Hz" if f0 else v.name)
 
+    @staticmethod
+    def _voice_gender_from_name(voice_name: str) -> str:
+        """Infer voice gender from Kokoro naming convention (e.g. af_*, am_*)."""
+        stem = voice_name.split("_", 1)[0].lower()
+        if len(stem) >= 2:
+            if stem[1] == "f":
+                return "female"
+            if stem[1] == "m":
+                return "male"
+        return "unknown"
+
+    @staticmethod
+    def _infer_ref_gender_from_f0(ref_f0: float) -> str:
+        """Coarse pitch-based gender inference for clone guidance."""
+        if ref_f0 <= 0:
+            return "unknown"
+        if ref_f0 < 155.0:
+            return "male"
+        if ref_f0 > 185.0:
+            return "female"
+        return "unknown"
+
+    def _gender_mismatch_penalty(self, voice_name: str) -> float:
+        """Soft penalty to discourage wrong-gender dominant anchors."""
+        mode = self._vmatch_gender_guard_var.get().strip().lower()
+        if mode == "off":
+            return 0.0
+        ref_gender = self._effective_ref_gender()
+        if ref_gender == "unknown":
+            return 0.0
+        voice_gender = self._voice_gender_from_name(voice_name)
+        if voice_gender == "unknown":
+            return 0.0
+        if voice_gender == ref_gender:
+            return 0.0
+        if mode == "strict":
+            return 0.50
+        return 0.06
+
+    def _effective_ref_gender(self) -> str:
+        override = self._vmatch_ref_gender_override_var.get().strip().lower()
+        if override in ("male", "female"):
+            return override
+        return self._vmatch_ref_gender
+
+    def _voice_f0_hz(self, voice_name: str) -> float:
+        row = self._acoustic.get(voice_name, {})
+        try:
+            return float((row.get("f0_hz") or "").strip())
+        except (ValueError, TypeError, AttributeError):
+            return 0.0
+
     def _load_pitch_axis(self) -> None:
         """Build the pitch direction vector from the acoustic analysis CSV + loaded voice bins."""
         import csv as _csv
@@ -3069,6 +3317,7 @@ class VoiceLabApp:
         self.command_var.set(d.get("command_template", ""))
         self.ffmpeg_var.set(d.get("ffmpeg_path", "ffmpeg"))
         self.working_dir_var.set(d.get("working_dir", ""))
+        self.unsafe_shell_var.set(bool(d.get("unsafe_shell_mode", False)))
         self.voice_dir_var.set(d.get("voice_dir", ""))
         self.ratings_path_var.set(d.get("ratings_path", str(DEFAULT_RATINGS_PATH)))
         self.export_dir_var.set(d.get("export_dir", str(DEFAULT_EXPORT_DIR)))
@@ -3080,6 +3329,10 @@ class VoiceLabApp:
         self.save_sidecar_var.set(bool(d.get("save_sidecar", True)))
         self.mix_speed_var.set(float(d.get("mix_speed", 1.0)))
         self.mix_pitch_var.set(float(d.get("mix_pitch", 0.0)))
+        self._vmatch_ref_gender_override_var.set(str(d.get("vmatch_ref_gender_override", "auto")))
+        self._vmatch_gender_guard_var.set(str(d.get("vmatch_gender_guard", "soft")))
+        self._vmatch_sampling_var.set(str(d.get("vmatch_sampling", "classic")))
+        self._vmatch_prosody_map_var.set(bool(d.get("vmatch_prosody_map", False)))
         self.autosave_var.set(bool(d.get("autosave_config", True)))
         for i, slot in enumerate(d.get("slots", [])[:3]):
             self.active_vars[i].set(bool(slot.get("active", True)))
@@ -3116,6 +3369,7 @@ class VoiceLabApp:
             "command_template": self.command_var.get().strip(),
             "ffmpeg_path": self.ffmpeg_var.get().strip() or "ffmpeg",
             "working_dir": self.working_dir_var.get().strip(),
+            "unsafe_shell_mode": bool(self.unsafe_shell_var.get()),
             "voice_dir": self.voice_dir_var.get().strip(),
             "ratings_path": self.ratings_path_var.get().strip(),
             "export_dir": self.export_dir_var.get().strip(),
@@ -3128,6 +3382,10 @@ class VoiceLabApp:
             "autosave_config": bool(self.autosave_var.get()),
             "mix_speed": float(self.mix_speed_var.get()),
             "mix_pitch": float(self.mix_pitch_var.get()),
+            "vmatch_ref_gender_override": self._vmatch_ref_gender_override_var.get(),
+            "vmatch_gender_guard": self._vmatch_gender_guard_var.get(),
+            "vmatch_sampling": self._vmatch_sampling_var.get(),
+            "vmatch_prosody_map": bool(self._vmatch_prosody_map_var.get()),
             "slots": [{"active": bool(self.active_vars[i].get()), "voice": self.voice_vars[i].get().strip(),
                        "weight": float(self.weight_vars[i].get()), "pitch": float(self.pitch_vars[i].get()),
                        "speed": float(self.speed_vars[i].get())} for i in range(3)],
@@ -3138,6 +3396,7 @@ class VoiceLabApp:
         self.synth.command_template = self.command_var.get().strip()
         self.synth.ffmpeg_path = self.ffmpeg_var.get().strip() or "ffmpeg"
         self.synth.working_dir = self.working_dir_var.get().strip()
+        self.synth.unsafe_shell_mode = bool(self.unsafe_shell_var.get())
 
     def save_config(self) -> None:
         self._sync_synth()
@@ -3224,10 +3483,13 @@ class VoiceLabApp:
 
     def _bind_persistence(self) -> None:
         for var in [self.voice_dir_var, self.ratings_path_var, self.command_var,
-                    self.ffmpeg_var, self.working_dir_var, self.export_dir_var,
+                    self.ffmpeg_var, self.working_dir_var, self.unsafe_shell_var, self.export_dir_var,
                     self.export_name_var, self.test_sentence_var, self.preview_mode_var,
                     self.auto_preview_var, self.save_sidecar_var,
                     self.mix_speed_var, self.mix_pitch_var,
+                    self._vmatch_ref_gender_override_var, self._vmatch_gender_guard_var,
+                    self._vmatch_sampling_var,
+                    self._vmatch_prosody_map_var,
                     *self.active_vars, *self.voice_vars, *self.weight_vars,
                     *self.pitch_vars, *self.speed_vars]:
             try:
@@ -3341,6 +3603,10 @@ class VoiceLabApp:
                 mel.mean(axis=1),  contrast.mean(axis=1),
             ]).astype(np.float32)
 
+        def _extract_86_windows(windows: list[np.ndarray]) -> np.ndarray:
+            vecs = [_extract_86(w, sr_ref) for w in windows]
+            return np.mean(vecs, axis=0).astype(np.float32)
+
         def _extract_78(y: np.ndarray, sr: int) -> np.ndarray:
             """78-dim MFCC+Δ+ΔΔ mean+std for acoustic fallback."""
             m  = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
@@ -3352,13 +3618,53 @@ class VoiceLabApp:
                 d2.mean(axis=1), d2.std(axis=1),
             ]).astype(np.float32)
 
+        def _extract_78_windows(windows: list[np.ndarray]) -> np.ndarray:
+            vecs = [_extract_78(w, sr_ref) for w in windows]
+            return np.mean(vecs, axis=0).astype(np.float32)
+
+        # Match optimiser target sampling to Voice Match mode.
+        sample_mode = self._vmatch_sampling_var.get().strip().lower()
+        ref_windows: list[np.ndarray] = [y_ref]
+        try:
+            raw_dur = librosa.get_duration(path=ref_path)
+            if raw_dur > 20.0:
+                for offset_frac in (0.33, 0.66):
+                    y2, _, _ = self._vmatch_prepare_audio(
+                        ref_path, target_s=8.0, min_s=2.0,
+                        _force_offset_frac=offset_frac,
+                    )
+                    ref_windows.append(y2)
+        except Exception:
+            pass
+
+        if sample_mode == "medoid_dual" and len(ref_windows) > 1:
+            feats = [_extract_86(w, sr_ref) for w in ref_windows]
+            dmat = np.zeros((len(feats), len(feats)), dtype=np.float32)
+            for i in range(len(feats)):
+                for j in range(i + 1, len(feats)):
+                    d = _cosine_dist(feats[i], feats[j])
+                    dmat[i, j] = d
+                    dmat[j, i] = d
+            medoid_idx = int(np.argmin(dmat.mean(axis=1)))
+            anchor = ref_windows[medoid_idx]
+            anchor_f = _extract_86(anchor, sr_ref)
+
+            # expressive window = farthest in feature space from medoid
+            far_idx = int(np.argmax(dmat[medoid_idx]))
+            expressive = ref_windows[far_idx]
+            expressive_f = _extract_86(expressive, sr_ref)
+            ref_feats_target = (0.7 * anchor_f + 0.3 * expressive_f).astype(np.float32)
+            prog(f"Optimise: sampling=medoid_dual (anchor W{medoid_idx+1}, expr W{far_idx+1})")
+        else:
+            ref_feats_target = _extract_86_windows(ref_windows)
+            prog("Optimise: sampling=classic")
+
         try:
             if use_emb:
-                feats = _extract_86(y_ref, sr_ref)
-                target_emb = (feats @ self._vmatch_regressor).astype(np.float32)
+                target_emb = (ref_feats_target @ self._vmatch_regressor).astype(np.float32)
                 prog("Optimise: embedding mode — target computed")
             else:
-                ref_vec = _extract_78(y_ref, sr_ref)
+                ref_vec = _extract_78_windows(ref_windows)
                 prog("Optimise: acoustic mode — build fingerprints for faster/better optimisation")
         except Exception as exc:
             prog(f"Optimise: reference processing error — {exc}")
